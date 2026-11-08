@@ -1070,3 +1070,46 @@
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* ---- Built-in text-interaction surface (selection popup / right-click) ---- */
+.quoteActions {
+  display: inline-flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.quoteActionsMenu {
+  display: inline-flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 4px;
+  border-radius: 10px;
+  background: var(--dsw-specific-menu, var(--dsw-alias-bg-overlay));
+  box-shadow: var(--dsw-elevation-panel);
+}
+
+.quoteAction {
+  corner-shape: round;
+  background: var(--dsw-alias-button-floating-fill);
+  --dsw-elevation-stroke-color: var(--dsw-alias-border-l3);
+  box-shadow: var(--dsw-elevation-panel);
+  color: var(--dsw-alias-label-primary);
+  font: var(--dsw-font-xs-13);
+  cursor: pointer;
+  border: none;
+  border-radius: 999px;
+  padding: 5px 10px;
+  white-space: nowrap;
+}
+
+.quoteActionsMenu .quoteAction {
+  box-shadow: none;
+  background: transparent;
+  border-radius: 7px;
+  text-align: left;
+  padding: 6px 10px;
+}
+
+.quoteActionsMenu .quoteAction:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}

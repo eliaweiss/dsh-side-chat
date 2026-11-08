@@ -623,6 +623,151 @@ function PermissionSelect(props: {
   )
 }
 
+/** Encode text as a Markdown blockquote (one `> ` per line), like DSH's own Quote. */
+function toBlockquote(text: string): string {
+  return text.split('\n').map((line) => (line.trim() === '' ? '>' : `> ${line}`)).join('\n')
+}
+
+/** Focus the side-chat composer once the panel (floating or docked) has mounted. */
+function focusSidechatComposer(): void {
+  let tries = 0
+  const attempt = (): void => {
+    const input = document.querySelector<HTMLTextAreaElement>('textarea[data-sidechat-input]')
+    if (input !== null) {
+      input.focus()
+      input.setSelectionRange(input.value.length, input.value.length)
+      return
+    }
+    if (++tries < 30) window.requestAnimationFrame(attempt)
+  }
+  window.requestAnimationFrame(attempt)
+}
+
+/**
+ * Stage a selection as a quote in the side-chat composer without sending, so
+ * the user can type a prompt under it. `continue` keeps the active (or first)
+ * side chat; `new` detaches so the next send creates a fresh side chat.
+ * Quoting again into the same target appends another quote.
+ */
+function stageSelection(store: SidechatStore, parentSessionId: string, text: string, mode: 'new' | 'continue'): void {
+  const trimmed = text.trim()
+  if (trimmed === '') return
+  const before = store.getSnapshot().panel
+  const sameParent = before.parentSessionId === parentSessionId || before.parentSessionId === ''
+  const target = mode === 'continue' ? (before.activeChildId ?? before.items[0]?.childId ?? null) : null
+  store.openPanel(parentSessionId)
+  if (target !== null) {
+    if (target !== before.activeChildId) {
+      store.setActive(target)
+      void refreshHistory(store, target)
+    }
+    const prev = store.getSnapshot().panel.attachment
+    store.patch({ attachment: prev === null || prev === '' ? trimmed : `${prev}\n\n${trimmed}` })
+  } else {
+    const keep = sameParent && before.activeChildId === null && before.attachment !== null && before.attachment !== ''
+    store.patch({
+      attachment: keep ? `${before.attachment}\n\n${trimmed}` : trimmed,
+      activeChildId: null,
+      messages: [],
+      ...(keep ? {} : { draft: '', provider: '', model: '', effort: '' }),
+    })
+    if (!keep) {
+      void api.inherit({ parentSessionId }).then((result) => {
+        if (result.ok) {
+          store.patch({
+            provider: result.value.provider,
+            model: result.value.model,
+            effort: result.value.reasoningEffort ?? '',
+          })
+        }
+      })
+    }
+    void refreshDirectory(store)
+  }
+  focusSidechatComposer()
+}
+
+/** Text-interaction id for the right-click menu on selected chat text. */
+const CONTEXT_INTERACTION_ID = 'dsh-side-chat.quote-context'
+
+/** Set once the built-in text-interaction surface hosts our actions (the legacy floating menu then stays off). */
+let quoteSurfaceIntegrated = false
+
+/** Props the Chat view passes to `conversation.chat.text-interaction` entries (DSH 0.2.x). */
+interface TextInteractionSlotProps {
+  trigger?: string
+  readText: () => string | null
+  dismiss: () => void
+  clearSelection: () => void
+  inputActions?: { insertQuote?: (text: string) => boolean }
+}
+
+/**
+ * Selection popup / right-click surface: the built-in "Quote text" (main
+ * composer) plus "Quote in side chat" and "Quote in current side chat". Both
+ * side-chat actions only stage the quote; nothing is sent.
+ */
+function QuoteActions(props: TextInteractionSlotProps & {
+  store: SidechatStore
+  sideT: (key: SidechatLocaleKey) => string
+  currentSessionId: () => string | undefined
+}) {
+  const snap = useSyncExternalStore(props.store.subscribe, props.store.getSnapshot)
+  // Panel state is per conversation (the store swaps it on Session change).
+  const hasSide = snap.panel.activeChildId !== null || snap.panel.items.length > 0
+  const run = (action: (text: string) => void): void => {
+    const text = props.readText()
+    if (text === null || text.trim() === '') {
+      props.dismiss()
+      return
+    }
+    action(text)
+    props.clearSelection()
+    props.dismiss()
+  }
+  const toSide = (mode: 'new' | 'continue') => (text: string): void => {
+    const id = props.currentSessionId()
+    if (id !== undefined) stageSelection(props.store, id, text, mode)
+  }
+  const insertQuote = props.inputActions?.insertQuote
+  const menu = props.trigger === 'contextmenu'
+  return (
+    <div className={menu ? css.quoteActionsMenu : css.quoteActions} role={menu ? 'menu' : undefined}>
+      {insertQuote !== undefined && (
+        <button
+          type="button"
+          role={menu ? 'menuitem' : undefined}
+          className={css.quoteAction}
+          onPointerDown={(e) => { e.preventDefault() }}
+          onClick={() => { run((text) => { insertQuote(text) }) }}
+        >
+          {props.sideT('quote.main')}
+        </button>
+      )}
+      <button
+        type="button"
+        role={menu ? 'menuitem' : undefined}
+        className={css.quoteAction}
+        onPointerDown={(e) => { e.preventDefault() }}
+        onClick={() => { run(toSide('new')) }}
+      >
+        {props.sideT('quote.side')}
+      </button>
+      {hasSide && (
+        <button
+          type="button"
+          role={menu ? 'menuitem' : undefined}
+          className={css.quoteAction}
+          onPointerDown={(e) => { e.preventDefault() }}
+          onClick={() => { run(toSide('continue')) }}
+        >
+          {props.sideT('quote.sideContinue')}
+        </button>
+      )}
+    </div>
+  )
+}
+
 /**
  * The floating selection menu: listens to the document selection and shows
  * one or two buttons (start / continue), dispatching to the host API.
@@ -703,21 +848,7 @@ function SelectionMenu(props: { store: SidechatStore; t: (key: SidechatLocaleKey
         }
       })
     } else {
-      // Stage the selection as an attachment; a new side chat is created on
-      // send. Detach from any previously active child, but show the parent's
-      // inherited model until the user picks one.
-      props.store.openPanel(parentSessionId)
-      props.store.patch({ attachment: text, activeChildId: null, messages: [], draft: '', provider: '', model: '', effort: '' })
-      void api.inherit({ parentSessionId }).then((result) => {
-        if (result.ok) {
-          props.store.patch({
-            provider: result.value.provider,
-            model: result.value.model,
-            effort: result.value.reasoningEffort ?? '',
-          })
-        }
-      })
-      void refreshDirectory(props.store)
+      stageSelection(props.store, parentSessionId, text, 'new')
     }
     setLocal(null)
   }, [local, current, prefs, props.store])
@@ -741,7 +872,7 @@ function SelectionMenu(props: { store: SidechatStore; t: (key: SidechatLocaleKey
         void refreshHistory(props.store, active)
       })
     } else {
-      props.store.patch({ attachment: text })
+      stageSelection(props.store, parentSessionId, text, 'continue')
     }
     setLocal(null)
   }, [local, current, prefs, props.store])
@@ -1118,7 +1249,7 @@ function SidechatPanel(props: {
 
   const send = useCallback(() => {
     const draft = panel.draft.trim()
-    const attachment = panel.attachment === null ? '' : panel.attachment
+    const attachment = panel.attachment === null || panel.attachment.trim() === '' ? '' : toBlockquote(panel.attachment.trim())
     const text = attachment === '' ? draft : (draft === '' ? attachment : `${attachment}\n\n${draft}`)
     void serializeImages(panel.attachments).then((imageParts) => {
       const content: PromptContentPart[] = [...imageParts, ...(text === '' ? [] : [{ type: 'text', text }] as PromptContentPart[])]
@@ -1604,8 +1735,8 @@ function SidechatPanel(props: {
 
       <div className={css.panelComposer}>
         {panel.attachment !== null && (
-          <div className={css.panelAttachment}>
-            <span className={css.panelAttachmentText}>{panel.attachment}</span>
+          <div className={css.panelAttachment} title={panel.attachment}>
+            <span className={css.panelAttachmentText}><strong>{props.t('panel.quoteLabel')}:</strong> {panel.attachment}</span>
             <button type="button" className={css.panelAttachmentRemove} onClick={() => { props.store.patch({ attachment: null }) }}>×</button>
           </div>
         )}
@@ -1620,6 +1751,7 @@ function SidechatPanel(props: {
           </div>
         )}
         <textarea
+          data-sidechat-input=""
           className={css.panelTextarea}
           placeholder={props.t('panel.input.placeholder')}
           value={panel.draft}
@@ -1774,7 +1906,7 @@ function SideChatShell(props: {
 
   return (
     <>
-      <SelectionMenu store={props.store} t={props.t} />
+      {!quoteSurfaceIntegrated && <SelectionMenu store={props.store} t={props.t} />}
       <BringBackMenu store={props.store} t={props.t} bringToMain={props.bringToMain} summarizeBring={props.summarizeBring} />
       {/* The pending-question entry floats in the portal, not inside the panel:
           in dock mode the panel (and its tab body) does not exist until the tab
@@ -2121,6 +2253,51 @@ export function apply(ctx: Context): void {
     })
     return () => { offZh(); offEn(); offSub() }
   }, 'dsh-side-chat: dictionaries')
+
+  // Selection popup + right-click menu on chat text, through DSH's own
+  // text-interaction surface (so the built-in "Quote text" stays available).
+  const uiConversation = ctx.get('uiConversation') as {
+    interactions?: {
+      register(definition: {
+        id: string
+        onInteraction(request: {
+          trigger: string
+          readText(): string | null
+          open(): void
+          preventDefault(): void
+        }): void
+      }): () => void
+    }
+  } | undefined
+  if (uiConversation?.interactions !== undefined) {
+    quoteSurfaceIntegrated = true
+    const quoteT = (key: SidechatLocaleKey): string => translate(activeLocale, key)
+    const quoteInject = () => ({ store, sideT: quoteT, currentSessionId })
+    // Shadow the built-in Quote action (lowest priority renders) with the
+    // combined Quote / Quote-in-side-chat surface.
+    ctx.slots.inject('conversation.chat.text-interaction', () => ctx.slots.register({
+      name: 'conversation.chat.text-interaction',
+      key: 'quote',
+      priority: -10,
+      inject: quoteInject,
+    }, QuoteActions as never))
+    // Right-click on selected chat text: same actions as a small menu.
+    ctx.effect(() => uiConversation.interactions!.register({
+      id: CONTEXT_INTERACTION_ID,
+      onInteraction(request) {
+        if (request.trigger !== 'contextmenu') return
+        const text = request.readText()
+        if (text === null || text.trim() === '') return
+        request.preventDefault()
+        request.open()
+      },
+    }), 'dsh-side-chat: right-click quote interaction')
+    ctx.slots.inject('conversation.chat.text-interaction', () => ctx.slots.register({
+      name: 'conversation.chat.text-interaction',
+      key: CONTEXT_INTERACTION_ID,
+      inject: quoteInject,
+    }, QuoteActions as never))
+  }
 
   // Load the persisted preferences once.
   void api.settingsGet().then((result) => {

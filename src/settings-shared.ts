@@ -29,7 +29,7 @@ export interface SubchatPrefs {
 /** Fallback prefs used whenever the settings document is unreachable or malformed. */
 export const SUBCHAT_PREFS_DEFAULTS: SubchatPrefs = {
   lookupDefault: false,
-  sendImmediately: true,
+  sendImmediately: false,
   defaultPrompt: '',
   bringMode: 'draft',
   panelHome: 'sidebar-right',
