@@ -29,6 +29,7 @@ import {
   type ImageLoader,
 } from './attachments/index.ts'
 import { SidechatErrorBoundary } from './ErrorBoundary.tsx'
+import { escapeCurrency } from './currency.ts'
 import type { Context, SidePendingInteraction, SideQuestionItem, SideQuestionOption, SideSidebarRight, SideSidebarRightTabs } from '../context-types.ts'
 import {
   api,
@@ -1690,7 +1691,7 @@ function SidechatPanel(props: {
               {reasoningBlocks.map((block, rIndex) => (
                 <ReasoningRow key={rIndex} text={block.type === 'reasoning' ? block.text : ''} t={props.t} />
               ))}
-              {text !== '' && <MarkdownText text={text} labels={markdownLabels} />}
+              {text !== '' && <MarkdownText text={escapeCurrency(text)} labels={markdownLabels} />}
               {text !== '' && (
                 <div className={css.messageActions}>
                   <button
