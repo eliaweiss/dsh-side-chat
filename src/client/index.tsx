@@ -13,6 +13,7 @@ import {
   IconCheckOutlineRegular,
   IconChevronDownOutlineRegular,
   IconChevronRightOutlineRegular,
+  IconCopyOutlineRegular,
   IconPanelLeftOutlineRegular,
   IconSendOutlineRegular,
   IconStopFillRegular,
@@ -30,6 +31,7 @@ import {
 } from './attachments/index.ts'
 import { SidechatErrorBoundary } from './ErrorBoundary.tsx'
 import { escapeCurrency } from './currency.ts'
+import { useCopyText } from './clipboard.ts'
 import type { Context, SidePendingInteraction, SideQuestionItem, SideQuestionOption, SideSidebarRight, SideSidebarRightTabs } from '../context-types.ts'
 import {
   api,
@@ -380,6 +382,26 @@ type DirectoryReasoning = SidechatDirectory['groups'][number]['models'][number][
 function firstLine(text: string): string {
   const end = text.indexOf('\n')
   return end === -1 ? text : text.slice(0, end)
+}
+
+/** Main-conversation-style Copy button for one assistant reply (copies its Markdown). */
+function CopyReplyButton(props: { text: string; t: (key: SidechatLocaleKey) => string }) {
+  const { copied, onCopy } = useCopyText(props.text)
+  const label = copied ? props.t('panel.copied') : props.t('panel.copy')
+  return (
+    <Tooltip label={label} side="bottom">
+      <button
+        type="button"
+        className={css.messageCopyButton}
+        aria-label={label}
+        data-testid="sidechat-copy-reply"
+        data-copied={copied || undefined}
+        onClick={onCopy}
+      >
+        {copied ? <IconCheckOutlineRegular /> : <IconCopyOutlineRegular />}
+      </button>
+    </Tooltip>
+  )
 }
 
 /** Main-conversation-style reasoning disclosure row (Think). */
@@ -1694,6 +1716,7 @@ function SidechatPanel(props: {
               {text !== '' && <MarkdownText text={escapeCurrency(text)} labels={markdownLabels} />}
               {text !== '' && (
                 <div className={css.messageActions}>
+                  <CopyReplyButton text={text} t={props.t} />
                   <button
                     type="button"
                     className={css.messageInsertButton}

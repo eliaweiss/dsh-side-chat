@@ -525,8 +525,34 @@
 /* Per-assistant-message "bring whole reply to main" actions. */
 .messageActions {
   display: flex;
+  align-items: center;
   gap: 6px;
   margin-top: 6px;
+}
+
+/* Icon-only Copy, styled like the main conversation's message actions. */
+.messageCopyButton {
+  width: 24px;
+  height: 24px;
+  padding: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--dsw-radius-sm);
+  background: transparent;
+  color: var(--dsw-alias-label-tertiary);
+  cursor: pointer;
+}
+
+.messageCopyButton svg {
+  width: 15px;
+  height: 15px;
+}
+
+.messageCopyButton:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+  color: var(--dsw-alias-label-secondary);
 }
 
 .messageInsertButton {
