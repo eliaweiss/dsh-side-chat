@@ -71,6 +71,7 @@ function mount(options: { failUnarchive?: boolean } = {}): Harness {
           session: { id: options.sessionId },
           ctx: {},
           followup: () => { log.push(`followup:${options.sessionId}`) },
+          steer: () => { log.push(`steer:${options.sessionId}`) },
           inject: vi.fn(),
           cancel: vi.fn(),
           whenIdle: () => new Promise<void>((resolve) => {
@@ -192,4 +193,21 @@ test('a failed restore refuses the delivery instead of opening a turn the gate w
 
   expect(started.status).not.toBe(200)
   expect(h.log.some((entry) => entry.startsWith('followup:'))).toBe(false)
+})
+
+test('a steered message goes into the running turn and keeps the session unarchived until it settles', async () => {
+  const h = mount()
+  const started = await h.call('sidechat.start', {
+    parentSessionId: 'parent-1',
+    content: [{ type: 'text', text: 'first' }],
+  })
+  const childId = started.body.value.childId
+  const steered = await h.call('sidechat.steer', { childId, content: [{ type: 'text', text: 'push this' }] })
+  expect(steered.status).toBe(200)
+  expect(h.log).toEqual([`unarchive:${childId}`, `followup:${childId}`, `unarchive:${childId}`, `steer:${childId}`])
+
+  await h.settle(childId)
+  expect(h.log).not.toContain(`archive:${childId}`)
+  await h.settle(childId)
+  expect(h.log.at(-1)).toBe(`archive:${childId}`)
 })

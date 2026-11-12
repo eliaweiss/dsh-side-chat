@@ -77,6 +77,8 @@ export const api = {
     call<{ childId: string; provider: string; model: string; reasoningEffort?: string }>('sidechat.start', args),
   followup: (args: { childId: string; content: PromptContentPart[]; lookupEnabled: boolean }) =>
     call<{ accepted: true }>('sidechat.followup', args),
+  steer: (args: { childId: string; content: PromptContentPart[]; lookupEnabled: boolean }) =>
+    call<{ accepted: true }>('sidechat.steer', args),
   list: (args: { parentSessionId: string }) =>
     call<{ items: SidechatListItem[] }>('sidechat.list', args),
   history: (args: { childId: string }) =>

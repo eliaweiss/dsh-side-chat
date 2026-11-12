@@ -208,6 +208,8 @@ export interface SideAgent {
   /** Durable model choice; present from DSH 0.2.2-alpha.3, absent on the 0.2.1 line. */
   readonly model?: SideAgentModel
   followup(message: unknown): void
+  /** Next-step input into the running turn; optional so older hosts still type-check. */
+  steer?(message: unknown): void
   inject(message: unknown): void
   cancel(cause: { kind: 'user' | 'parent' | 'disposed' } | { kind: 'hook'; reason: string }): void
   whenIdle(): Promise<void>

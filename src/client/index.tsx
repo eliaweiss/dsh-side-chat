@@ -5,7 +5,7 @@
  * section. The panel is isolated per current conversation and talks to the
  * host /sidechat API.
  */
-import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
 import { useSyncExternalStore } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import {
@@ -32,6 +32,7 @@ import {
 import { SidechatErrorBoundary } from './ErrorBoundary.tsx'
 import { escapeCurrency } from './currency.ts'
 import { useCopyText } from './clipboard.ts'
+import { FOLLOW_THRESHOLD_PX, STALE_ECHO_MS, unresolvedEchoes, userMessageCount, type PendingEcho } from './pending.ts'
 import type { Context, SidePendingInteraction, SideQuestionItem, SideQuestionOption, SideSidebarRight, SideSidebarRightTabs } from '../context-types.ts'
 import {
   api,
@@ -1147,6 +1148,10 @@ function SidechatPanel(props: {
   const [bringingKey, setBringingKey] = useState<string | null>(null)
   /** Whether the question-dialog list is collapsed (headers only). */
   const [questionCollapsed, setQuestionCollapsed] = useState(false)
+  /** Local echoes of sent messages the transcript has not recorded yet. */
+  const [pending, setPending] = useState<PendingEcho[]>([])
+  /** Whether the transcript follows new output (true while the reader sits at the bottom). */
+  const followRef = useRef(true)
 
   // Auto-expand the panel whenever a side chat is started or activated, so
   // starting from a collapsed panel still reveals the conversation.
@@ -1199,6 +1204,8 @@ function SidechatPanel(props: {
 
   const activeItem = panel.items.find((i) => i.childId === panel.activeChildId)
   const activeRunning = activeItem?.running ?? false
+  /** The composer holds something sendable (text, a quote, or images). */
+  const hasDraft = panel.draft.trim() !== '' || (panel.attachment !== null && panel.attachment.trim() !== '') || panel.attachments.length > 0
   const [anchor, setAnchor] = useState<number | null>(null)
 
   useEffect(() => {
@@ -1251,10 +1258,41 @@ function SidechatPanel(props: {
     return () => { window.clearInterval(id) }
   }, [activeRunning])
 
+  // Switching side chats starts at the bottom and drops the other chat's echoes.
   useEffect(() => {
+    followRef.current = true
+    setPending([])
+  }, [panel.activeChildId])
+
+  // Like the main chat: follow new output only while the reader is at the
+  // bottom. Scrolling up stops following; scrolling back down resumes it.
+  const onTranscriptScroll = useCallback(() => {
     const el = scrollRef.current
-    if (el !== null) el.scrollTop = el.scrollHeight
-  }, [panel.messages.length, panel.activeChildId])
+    if (el === null) return
+    followRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= FOLLOW_THRESHOLD_PX
+  }, [])
+
+  // Match local echoes against the recorded transcript; a matched echo is gone.
+  const visiblePending = useMemo(() => unresolvedEchoes(pending, panel.messages), [pending, panel.messages])
+  useEffect(() => {
+    if (visiblePending.length !== pending.length) setPending(visiblePending)
+  }, [visiblePending, pending.length])
+
+  // An echo whose message never landed (the turn was stopped and its queue
+  // cleared) is dropped once the side chat has stayed idle for a while.
+  useEffect(() => {
+    if (activeRunning || pending.length === 0) return
+    const id = window.setTimeout(() => {
+      const cutoff = Date.now() - STALE_ECHO_MS
+      setPending((list) => list.filter((p) => p.sentAt > cutoff))
+    }, STALE_ECHO_MS)
+    return () => { window.clearTimeout(id) }
+  }, [activeRunning, pending])
+
+  useLayoutEffect(() => {
+    const el = scrollRef.current
+    if (el !== null && followRef.current) el.scrollTop = el.scrollHeight
+  }, [panel.messages, panel.activeChildId, visiblePending.length, activeRunning, panel.error])
 
   useEffect(() => {
     if (!panel.open || panel.activeChildId === null) return
@@ -1270,7 +1308,12 @@ function SidechatPanel(props: {
     return () => { window.clearInterval(id) }
   }, [panel.open, panel.activeChildId, props.store])
 
-  const send = useCallback(() => {
+  /**
+   * Send the composer. While the side chat runs, the default pushes the
+   * message into the running turn (steer); `queue` holds it for the next turn,
+   * like the main chat's Cmd/Ctrl+Enter.
+   */
+  const send = useCallback((runningMode: 'queue' | 'steer' = 'steer') => {
     const draft = panel.draft.trim()
     const attachment = panel.attachment === null || panel.attachment.trim() === '' ? '' : toBlockquote(panel.attachment.trim())
     const text = attachment === '' ? draft : (draft === '' ? attachment : `${attachment}\n\n${draft}`)
@@ -1308,10 +1351,24 @@ function SidechatPanel(props: {
       }
 
       const childId = panel.activeChildId
+      const mode: PendingEcho['mode'] = activeRunning ? runningMode : 'send'
+      const echo: PendingEcho = {
+        id: `echo-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        text,
+        images: imageParts.length,
+        mode,
+        baseline: userMessageCount(panel.messages),
+        sentAt: Date.now(),
+      }
+      // Your own message always brings the transcript back to the bottom.
+      followRef.current = true
+      setPending((list) => [...list, echo])
       setItemRunning(props.store, childId, true)
-      void api.followup({ childId, content, lookupEnabled: panel.lookup }).then((result) => {
+      const deliver = mode === 'steer' ? api.steer : api.followup
+      void deliver({ childId, content, lookupEnabled: panel.lookup }).then((result) => {
         if (!result.ok) {
-          setItemRunning(props.store, childId, false)
+          setPending((list) => list.filter((p) => p.id !== echo.id))
+          if (!activeRunning) setItemRunning(props.store, childId, false)
           props.store.patch({ error: result.error.message })
         }
         void refreshList(props.store, panel.parentSessionId)
@@ -1320,12 +1377,14 @@ function SidechatPanel(props: {
     }).catch((error: unknown) => {
       props.store.patch({ error: error instanceof Error ? error.message : String(error) })
     })
-  }, [panel, props.store])
+  }, [panel, props.store, activeRunning])
 
   const stop = useCallback(() => {
     if (panel.activeChildId === null) return
     const childId = panel.activeChildId
     setItemRunning(props.store, childId, false)
+    // Stopping clears the side chat's queued and steering messages on the host.
+    setPending([])
     void api.stop({ childId }).then(() => {
       void refreshList(props.store, panel.parentSessionId)
       void refreshHistory(props.store, childId)
@@ -1691,7 +1750,7 @@ function SidechatPanel(props: {
             )}
       </div>
 
-      <div className={css.panelTranscript} ref={scrollRef}>
+      <div className={css.panelTranscript} ref={scrollRef} onScroll={onTranscriptScroll}>
         {panel.messages.map((message, index) => {
           const textBlocks = message.blocks.filter((b) => b.type === 'text')
           const imageBlocks = message.blocks.filter((b) => b.type === 'image')
@@ -1747,6 +1806,17 @@ function SidechatPanel(props: {
             </div>
           )
         })}
+        {visiblePending.map((echo) => (
+          <div key={echo.id} className={css.messagePending} data-sidechat-pending={echo.mode}>
+            <div className={css.messageUser}>
+              {echo.text !== '' && <span className={css.messageUserText}>{echo.text}</span>}
+              {echo.images > 0 && <span className={css.messagePendingImages}>{props.t('image.label')} × {echo.images}</span>}
+            </div>
+            <span className={css.messagePendingLabel}>
+              {echo.mode === 'steer' ? props.t('panel.pending.steer') : echo.mode === 'queue' ? props.t('panel.pending.queue') : props.t('panel.pending.send')}
+            </span>
+          </div>
+        ))}
         {activeRunning && (
           <div className={css.panelRunning} role="status" aria-live="polite">
             <span className={css.panelRunningDot} />
@@ -1777,14 +1847,15 @@ function SidechatPanel(props: {
         <textarea
           data-sidechat-input=""
           className={css.panelTextarea}
-          placeholder={props.t('panel.input.placeholder')}
+          placeholder={activeRunning ? props.t('panel.input.placeholderRunning') : props.t('panel.input.placeholder')}
           value={panel.draft}
           onChange={(e) => { props.store.patch({ draft: e.target.value }) }}
           onPaste={onPaste}
           onKeyDown={(e) => {
-            if (e.key === 'Enter' && !e.shiftKey) {
+            if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
               e.preventDefault()
-              send()
+              // While running: Enter steers into the current turn, Cmd/Ctrl+Enter queues for the next one.
+              send(e.metaKey || e.ctrlKey ? 'queue' : 'steer')
             }
           }}
         />
@@ -1801,14 +1872,28 @@ function SidechatPanel(props: {
             onSelect={onPresetChange}
             t={props.t}
           />
-          <Tooltip label={activeRunning ? props.t('panel.stop') : props.t('panel.send')} side="top" delayMs={500}>
+          {activeRunning && hasDraft && (
+            <Tooltip label={props.t('panel.stop')} side="top" delayMs={500}>
+              <button type="button" className={css.secondary} aria-label={props.t('panel.stop')} onClick={stop}>
+                <IconStopFillRegular size={14} />
+              </button>
+            </Tooltip>
+          )}
+          <Tooltip
+            label={!activeRunning ? props.t('panel.send') : hasDraft ? props.t('panel.steer') : props.t('panel.stop')}
+            side="top"
+            delayMs={500}
+          >
             <button
               type="button"
               className={css.primary}
-              aria-label={activeRunning ? props.t('panel.stop') : props.t('panel.send')}
-              onClick={activeRunning ? stop : send}
+              aria-label={!activeRunning ? props.t('panel.send') : hasDraft ? props.t('panel.steer') : props.t('panel.stop')}
+              onClick={(e) => {
+                if (activeRunning && !hasDraft) stop()
+                else send(e.metaKey || e.ctrlKey ? 'queue' : 'steer')
+              }}
             >
-              {activeRunning ? <IconStopFillRegular size={16} /> : <IconSendOutlineRegular size={16} />}
+              {activeRunning && !hasDraft ? <IconStopFillRegular size={16} /> : <IconSendOutlineRegular size={16} />}
             </button>
           </Tooltip>
         </div>

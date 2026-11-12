@@ -496,11 +496,16 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
    * opens the driver synchronously (the phase turns `running` before it
    * returns), so observing `whenIdle` right after it can never miss the turn.
    */
-  const deliver = async (record: SidechatRecord, message: unknown): Promise<void> => {
+  const deliver = async (record: SidechatRecord, message: unknown, mode: 'queue' | 'steer' = 'queue'): Promise<void> => {
     record.pendingTurns += 1
     try {
       await unarchiveChild(record.childId)
-      record.handle.agent.followup(message)
+      // `steer` lands the message at the running turn's next step (the main
+      // chat's "Steer message"); `followup` queues it as the next turn. A host
+      // without `steer` falls back to queueing.
+      const agent = record.handle.agent
+      if (mode === 'steer' && typeof agent.steer === 'function') agent.steer(message)
+      else agent.followup(message)
     } catch (error) {
       // Balance the count: the delivery never opened a turn.
       settleTurn(record)
@@ -628,8 +633,8 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     return { childId, provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
   }
 
-  /** Deliver one later message to an existing side chat. */
-  const followup = async (payload: unknown): Promise<{ accepted: true }> => {
+  /** Deliver one later message to an existing side chat (queued next turn, or steered into the running one). */
+  const deliverLater = async (payload: unknown, mode: 'queue' | 'steer'): Promise<{ accepted: true }> => {
     const childId = requireString(payload, 'childId')
     const content = requireContent(payload)
     const lookupEnabled = optionalBoolean(payload, 'lookupEnabled')
@@ -640,13 +645,17 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       // A child adopted from the live agent registry (record lost) still needs
       // its archive lifted before a turn it did not create itself.
       await unarchiveChild(childId)
-      child.followup(message)
+      if (mode === 'steer' && typeof child.steer === 'function') child.steer(message)
+      else child.followup(message)
       void child.whenIdle().then(() => { void archiveChild(childId) }, () => { void archiveChild(childId) })
       return { accepted: true }
     }
-    await deliver(record, message)
+    await deliver(record, message, mode)
     return { accepted: true }
   }
+
+  const followup = (payload: unknown): Promise<{ accepted: true }> => deliverLater(payload, 'queue')
+  const steer = (payload: unknown): Promise<{ accepted: true }> => deliverLater(payload, 'steer')
 
   /** List the side chats launched by one parent conversation. */
   const list = async (payload: unknown): Promise<{ items: Array<{ childId: string; running: boolean; runningSince?: number }> }> => {
@@ -932,6 +941,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   return {
     'sidechat.start': start,
     'sidechat.followup': followup,
+    'sidechat.steer': steer,
     'sidechat.list': list,
     'sidechat.history': history,
     'sidechat.stop': stop,
