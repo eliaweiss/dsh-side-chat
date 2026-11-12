@@ -10,7 +10,8 @@
  *   absence.
  */
 import { Readable } from 'node:stream'
-import { expect, test, vi } from 'vitest'
+import { rm } from 'node:fs/promises'
+import { beforeEach, expect, test, vi } from 'vitest'
 
 const home = vi.hoisted(() => `${process.env.TEMP ?? process.env.TMP ?? '/tmp'}/dsh-side-chat-request-failure-test`)
 
@@ -112,6 +113,10 @@ function mount(options: { rejectImages?: boolean; readFailure?: Error } = {}): H
 
   return { call, created: () => created }
 }
+
+// Side chats now survive a reload through the record file, so each test
+// starts from an empty one instead of an earlier run's records.
+beforeEach(async () => { await rm(home, { recursive: true, force: true }) })
 
 test('a rejected prompt image answers 400 and never leaves a side chat behind', async () => {
   const h = mount({ rejectImages: true })

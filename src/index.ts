@@ -135,8 +135,15 @@ function recordFilePath(): string {
   return dshHomePath(RECORD_FILE)
 }
 
+/** One durable side-chat record (what survives a restart or plugin reload). */
+interface StoredRecord {
+  childId: string
+  parentSessionId: string
+  createdAt: number
+}
+
 /** Read the durable side-chat record list (absent/malformed → empty). */
-async function readRecords(): Promise<Array<{ childId: string; parentSessionId: string; createdAt: number }>> {
+async function readRecords(): Promise<StoredRecord[]> {
   try {
     const raw = await readFile(recordFilePath(), 'utf8')
     const parsed = JSON.parse(raw) as unknown
@@ -263,14 +270,46 @@ interface SubchatSettingsFace {
 
 /** The API method table bound to the plugin context and the live side-chat map. */
 function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSettings: () => SubchatSettingsFace | undefined) {
-  /** Persist the current live records (best-effort; never blocks the API). */
+  /**
+   * Side chats recorded by an earlier run whose agents are not live in this
+   * one (the app restarted or the plugin reloaded). They stay listed under
+   * their conversation and are resumed on their next message.
+   */
+  const dormant = new Map<string, StoredRecord>()
+  const loaded: Promise<void> = (async () => {
+    for (const record of await readRecords()) {
+      if (sideChats.has(record.childId) || dormant.has(record.childId)) continue
+      // Drop records whose session no longer exists (deleted elsewhere).
+      try {
+        await ctx.sessionQuery.readSession(record.childId)
+      } catch {
+        continue
+      }
+      dormant.set(record.childId, record)
+    }
+  })().catch((error: unknown) => {
+    console.warn('[dsh-side-chat] record restore failed:', error instanceof Error ? error.message : String(error))
+  })
+
+  /**
+   * Persist live and dormant records (best-effort; never blocks the API).
+   * Writes wait for the restore above, so an early write can never drop the
+   * records of an earlier run, and run one at a time in call order.
+   */
+  let writeChain: Promise<void> = loaded
   const persist = (): void => {
-    const records = [...sideChats.values()].map((record) => ({
-      childId: record.childId,
-      parentSessionId: record.parentSessionId,
-      createdAt: record.createdAt,
-    }))
-    void writeRecords(records).catch((error: unknown) => {
+    writeChain = writeChain.then(async () => {
+      const records: StoredRecord[] = [...sideChats.values()].map((record) => ({
+        childId: record.childId,
+        parentSessionId: record.parentSessionId,
+        createdAt: record.createdAt,
+      }))
+      for (const record of dormant.values()) {
+        if (!sideChats.has(record.childId)) records.push(record)
+      }
+      records.sort((a, b) => a.createdAt - b.createdAt)
+      await writeRecords(records)
+    }).catch((error: unknown) => {
       console.warn('[dsh-side-chat] record write failed:', error instanceof Error ? error.message : String(error))
     })
   }
@@ -388,9 +427,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   }
 
   /** List the host slash commands available to one side-chat agent. */
-  const commands = (payload: unknown): { commands: Array<{ name: string; description: string }> } => {
+  const commands = async (payload: unknown): Promise<{ commands: Array<{ name: string; description: string }> }> => {
     const childId = requireString(payload, 'childId')
-    const child = childOf(childId)
+    const child = await liveChildOf(childId)
     return { commands: ctx.commands.list(child).map((c) => ({ name: c.name, description: c.description })) }
   }
 
@@ -398,7 +437,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   const command = async (payload: unknown): Promise<{ executed: boolean }> => {
     const childId = requireString(payload, 'childId')
     const line = requireString(payload, 'line')
-    const child = childOf(childId)
+    const child = await liveChildOf(childId)
     const result = await ctx.commands.execute(child, line, [], new AbortController().signal)
     return { executed: result !== undefined }
   }
@@ -415,7 +454,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   /** Fold one side-chat agent's plan/goal state for its composer chrome. */
   const state = async (payload: unknown): Promise<{ plan: { active: boolean; pending: boolean }; goal: { id: string; objective: string } | null }> => {
     const childId = requireString(payload, 'childId')
-    childOf(childId)
+    // Reading the log needs no live agent: a dormant side chat folds the same way.
+    await loaded
+    if (!dormant.has(childId)) childOf(childId)
     const events = await sessionEvents(childId)
     // Plan fold mirrors dsh-plan-mode's `plan` projection.
     let planActive = false
@@ -514,6 +555,125 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     void record.handle.agent.whenIdle().then(() => { settleTurn(record) }, () => { settleTurn(record) })
   }
 
+  /**
+   * Compose one side-chat agent's scoped world: the launching conversation's
+   * toolset/prompt sections and the runtime-adjustable model selection. Shared
+   * by a fresh `start` and by `revive` after a restart or plugin reload.
+   */
+  const setupChild = (agentCtx: Context, parentCtx: Context | undefined, selection: SideModelSelectionRef): void => {
+    // Inherit the launching conversation's toolset/prompt sections.
+    if (parentCtx !== undefined) {
+      ctx.agentPresets.composeFrom(agentCtx, parentCtx)
+    }
+    // Model / reasoning-effort are adjustable at runtime.
+    //
+    // 0.2.2+: the choice is durable on the agent (recorded after creation),
+    // and the installer only adds the model-switch notice; a request-config
+    // rewrite would now throw against the step's fixed selection.
+    if (durableModelSelection) {
+      ;(installModelSelection as SideInstallModelSwitchNotice | undefined)?.(agentCtx)
+      return
+    }
+    // 0.2.1: the coupled installer snapshots the selection before prompt
+    // assembly delegates and applies the same value to the request config,
+    // so a switch made mid-turn lands on a later step instead of assembling
+    // the prompt for the inherited model while calling the selected one. An
+    // absent effort clears the inherited one, restoring default behavior.
+    if (installModelSelection !== undefined) {
+      ;(installModelSelection as SideInstallModelSelection)(agentCtx, selection)
+      return
+    }
+    // Fallback for builds without that API: rewrites the request config
+    // only, which can split prompt assembly from routing mid-turn.
+    agentCtx.on('agent/request', async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
+      const resolved = await next()
+      const sel = selection.current
+      if (sel === undefined) return resolved
+      const { reasoningEffort: _drop, ...rest } = resolved
+      return {
+        ...rest,
+        provider: sel.provider,
+        model: sel.model,
+        ...(sel.reasoningEffort === undefined ? {} : { reasoningEffort: sel.reasoningEffort }),
+      }
+    })
+  }
+
+  /**
+   * Bring a dormant side chat (recorded by an earlier run of this plugin, so
+   * its agent died with that run) back to life on its persisted session.
+   * Concurrent callers share one resume. Returns undefined for an id that is
+   * neither live nor recorded.
+   */
+  const reviving = new Map<string, Promise<SidechatRecord>>()
+  const revive = async (childId: string): Promise<SidechatRecord | undefined> => {
+    await loaded
+    const live = sideChats.get(childId)
+    if (live !== undefined) return live
+    const stub = dormant.get(childId)
+    if (stub === undefined) return undefined
+    // Still live in the registry (an earlier run's agent not torn down yet):
+    // callers adopt it through `childOf` instead of resuming a second one.
+    if (ctx.agents.get(childId) !== undefined) return undefined
+    const pending = reviving.get(childId)
+    if (pending !== undefined) return pending
+    const resume = ctx.agents.resume
+    if (typeof resume !== 'function') {
+      throw new SidechatError('child-unavailable', 'this DSH version cannot reopen a side chat from an earlier run', 409)
+    }
+    const run = (async (): Promise<SidechatRecord> => {
+      const parent = ctx.agents.get(stub.parentSessionId)
+      const route = parent === undefined ? undefined : parentRoute(parent)
+      const selection: SideModelSelectionRef = {
+        current: route === undefined || route.provider === '' || route.model === '' ? undefined : route,
+        assembled: undefined,
+      }
+      const handle = await resume.call(ctx.agents, {
+        resumeSessionId: childId,
+        ...(selection.current === undefined ? {} : { agentOptions: { provider: selection.current.provider, model: selection.current.model } }),
+        setup: (agentCtx: Context) => { setupChild(agentCtx, parent?.ctx, selection) },
+      })
+      // 0.2.2+: the durable choice was replayed from the session log; mirror it
+      // so a later `selectModel` starts from what the side chat really runs.
+      const durable = handle.agent.model?.current?.()
+      if (durable !== undefined) selection.current = durable
+      if (parent !== undefined) {
+        try {
+          const preset = ctx.permissionPresets.current(parent.session)
+          if (preset !== 'custom') ctx.permissionPresets.set(handle.agent.session, preset)
+        } catch (error) {
+          console.warn('[dsh-side-chat] permission inherit failed:', error instanceof Error ? error.message : String(error))
+        }
+      }
+      const record: SidechatRecord = {
+        childId,
+        parentSessionId: stub.parentSessionId,
+        handle,
+        selection,
+        createdAt: stub.createdAt,
+        pendingTurns: 0,
+      }
+      sideChats.set(childId, record)
+      dormant.delete(childId)
+      persist()
+      // Resuming may register the session as active; keep it hidden while idle.
+      void archiveChild(childId)
+      return record
+    })()
+    reviving.set(childId, run)
+    try {
+      return await run
+    } finally {
+      reviving.delete(childId)
+    }
+  }
+
+  /** The live agent behind a childId, reviving a dormant side chat first. */
+  const liveChildOf = async (childId: string): Promise<SideAgent> => {
+    const record = sideChats.get(childId) ?? await revive(childId)
+    return record?.handle.agent ?? childOf(childId)
+  }
+
   /** Create one side chat: inherit, record, deliver the first prompt (hidden while idle). */
   const start = async (payload: unknown): Promise<{ childId: string; provider: string; model: string; reasoningEffort?: string }> => {
     const parentSessionId = requireString(payload, 'parentSessionId')
@@ -561,44 +721,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         model,
         ...(maxTokens === undefined ? {} : { maxTokens }),
       },
-      setup: (agentCtx: Context) => {
-        // Inherit the launching conversation's toolset/prompt sections.
-        if (parentCtx !== undefined) {
-          ctx.agentPresets.composeFrom(agentCtx, parentCtx)
-        }
-        // Model / reasoning-effort are adjustable at runtime.
-        //
-        // 0.2.2+: the choice is durable on the agent (recorded after creation),
-        // and the installer only adds the model-switch notice; a request-config
-        // rewrite would now throw against the step's fixed selection.
-        if (durableModelSelection) {
-          ;(installModelSelection as SideInstallModelSwitchNotice | undefined)?.(agentCtx)
-          return
-        }
-        // 0.2.1: the coupled installer snapshots the selection before prompt
-        // assembly delegates and applies the same value to the request config,
-        // so a switch made mid-turn lands on a later step instead of assembling
-        // the prompt for the inherited model while calling the selected one. An
-        // absent effort clears the inherited one, restoring default behavior.
-        if (installModelSelection !== undefined) {
-          ;(installModelSelection as SideInstallModelSelection)(agentCtx, selection)
-          return
-        }
-        // Fallback for builds without that API: rewrites the request config
-        // only, which can split prompt assembly from routing mid-turn.
-        agentCtx.on('agent/request', async (_payload: unknown, next: () => Promise<Record<string, unknown>>) => {
-          const resolved = await next()
-          const sel = selection.current
-          if (sel === undefined) return resolved
-          const { reasoningEffort: _drop, ...rest } = resolved
-          return {
-            ...rest,
-            provider: sel.provider,
-            model: sel.model,
-            ...(sel.reasoningEffort === undefined ? {} : { reasoningEffort: sel.reasoningEffort }),
-          }
-        })
-      },
+      setup: (agentCtx: Context) => { setupChild(agentCtx, parentCtx, selection) },
     })
 
     // Record the inherited/selected route before the first step prepares, so
@@ -638,8 +761,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     const childId = requireString(payload, 'childId')
     const content = requireContent(payload)
     const lookupEnabled = optionalBoolean(payload, 'lookupEnabled')
-    const child = childOf(childId)
-    const record = sideChats.get(childId)
+    // A side chat from before a restart/reload is resumed on its next message.
+    const record = sideChats.get(childId) ?? await revive(childId)
+    const child = record?.handle.agent ?? childOf(childId)
     const message = userMessage(await durableContent(content, lookupEnabled))
     if (record === undefined) {
       // A child adopted from the live agent registry (record lost) still needs
@@ -683,12 +807,22 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         ...(runningSince !== undefined ? { runningSince } : {}),
       })
     }
+    // Side chats from an earlier run stay listed (idle) until reopened.
+    await loaded
+    for (const record of dormant.values()) {
+      if (record.parentSessionId !== parentSessionId || sideChats.has(record.childId)) continue
+      items.push({ childId: record.childId, running: false })
+    }
+    const createdAt = (id: string): number => sideChats.get(id)?.createdAt ?? dormant.get(id)?.createdAt ?? 0
+    items.sort((a, b) => createdAt(a.childId) - createdAt(b.childId))
     return { items }
   }
 
   /** Interrupt the active side chat's current turn (user-initiated stop). */
   const stop = (payload: unknown): { accepted: true } => {
     const childId = requireString(payload, 'childId')
+    // A dormant side chat has no turn to stop.
+    if (!sideChats.has(childId) && dormant.has(childId) && ctx.agents.get(childId) === undefined) return { accepted: true }
     const child = childOf(childId)
     child.cancel({ kind: 'user' })
     return { accepted: true }
@@ -739,11 +873,11 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   }
 
   /** Adjust one side chat's model / reasoning-effort. */
-  const selectModel = (payload: unknown): { accepted: true } => {
+  const selectModel = async (payload: unknown): Promise<{ accepted: true }> => {
     const childId = requireString(payload, 'childId')
     const provider = requireString(payload, 'provider')
     const model = requireString(payload, 'model')
-    const record = sideChats.get(childId)
+    const record = sideChats.get(childId) ?? await revive(childId)
     if (record === undefined) throw new SidechatError('child-unavailable', `side chat "${childId}" is not live`, 409)
     const reasoningEffort = (payload as Record<string, unknown> | null)?.reasoningEffort
     // Replace the whole object so the coupled listeners never observe a
@@ -760,9 +894,10 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   }
 
   /** Adjust one side chat's permission preset. */
-  const selectPermission = (payload: unknown): { accepted: true } => {
+  const selectPermission = async (payload: unknown): Promise<{ accepted: true }> => {
     const childId = requireString(payload, 'childId')
     const presetName = requireString(payload, 'presetName')
+    await liveChildOf(childId)
     const session = sessionOf(childId)
     ctx.permissionPresets.set(session, presetName)
     return { accepted: true }
@@ -771,6 +906,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   /** Close one side chat (tears down its agent and session). */
   const dispose = async (payload: unknown): Promise<{ accepted: true }> => {
     const childId = requireString(payload, 'childId')
+    await loaded
+    // Ending a dormant side chat only forgets its record (no live agent to stop).
+    if (dormant.delete(childId)) persist()
     const record = sideChats.get(childId)
     if (record !== undefined) {
       sideChats.delete(childId)

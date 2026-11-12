@@ -10,6 +10,13 @@ import { apply, Config } from '../src/index.ts'
 import { SUBCHAT_PREFS_DEFAULTS } from '../src/settings-shared.ts'
 import { migratedSession } from './v4-fixture.mjs'
 
+// Keep the durable record file out of the real harness home: a run here used
+// to overwrite the user's real side-chat list.
+const home = vi.hoisted(() => `${process.env.TEMP ?? process.env.TMP ?? '/tmp'}/dsh-side-chat-compat-test`)
+vi.mock('@deepseek-ai/dsh-home-paths', () => ({
+  dshHomePath: (...parts: string[]) => [home, ...parts].join('/'),
+}))
+
 // The host half persists its side-chat record list under the harness home; point
 // that at a throwaway directory so a test run never rewrites the real profile.
 process.env.DSH_HOME = mkdtempSync(join(tmpdir(), 'dsh-side-chat-test-'))

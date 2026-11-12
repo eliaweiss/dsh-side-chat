@@ -17,6 +17,13 @@ const { coupler } = vi.hoisted(() => ({ coupler: vi.fn(() => () => {}) }))
 // A 0.2.1-shaped agent package: the coupled installer only, no `AgentModel`.
 vi.mock('@deepseek-ai/dsh-agent', () => ({ installModelSelection: coupler }))
 
+// Keep the durable record file out of the real harness home: a run here used
+// to overwrite the user's real side-chat list.
+const home = vi.hoisted(() => `${process.env.TEMP ?? process.env.TMP ?? '/tmp'}/dsh-side-chat-legacy-test`)
+vi.mock('@deepseek-ai/dsh-home-paths', () => ({
+  dshHomePath: (...parts: string[]) => [home, ...parts].join('/'),
+}))
+
 const { apply } = await import('../src/index.ts')
 
 function mount() {

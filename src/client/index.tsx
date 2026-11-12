@@ -1108,6 +1108,14 @@ function SidechatPanel(props: {
   conflictHidden?: boolean
 }) {
   const { panel, mainQuestion, dismissedQuestionIds } = useSyncExternalStore(props.store.subscribe, props.store.getSnapshot)
+  /**
+   * Whether this panel is on screen. The docked panel is mounted only while its
+   * sidebar tab shows, and stays there after a page reload or app restart with
+   * `panel.open` false (that flag belongs to the floating panel). Gating the
+   * transcript polling on `panel.open` alone left a docked side chat frozen:
+   * a sent message stayed on "Sending…" and the reply never appeared.
+   */
+  const shown = props.embedded === true || panel.open
   const scrollRef = useRef<HTMLDivElement | null>(null)
   const markdownLabels = useMemo(() => ({
     code: { copyLabel: props.t('panel.copy'), copiedLabel: props.t('panel.copied') },
@@ -1239,10 +1247,10 @@ function SidechatPanel(props: {
   // Lazy-load the model/permission directory whenever the panel is open but the
   // directory has not hydrated yet (covers page reload + continue + direct open).
   useEffect(() => {
-    if (panel.open && panel.directory === null) {
+    if (shown && panel.directory === null) {
       void refreshDirectory(props.store)
     }
-  }, [panel.open, panel.directory, props.store])
+  }, [shown, panel.directory, props.store])
 
   useEffect(() => {
     if (activeRunning) {
@@ -1295,7 +1303,7 @@ function SidechatPanel(props: {
   }, [panel.messages, panel.activeChildId, visiblePending.length, activeRunning, panel.error])
 
   useEffect(() => {
-    if (!panel.open || panel.activeChildId === null) return
+    if (!shown || panel.activeChildId === null) return
     const tick = (): void => {
       const snap = props.store.getSnapshot().panel
       const childId = snap.activeChildId
@@ -1306,7 +1314,7 @@ function SidechatPanel(props: {
     tick()
     const id = window.setInterval(tick, 1200)
     return () => { window.clearInterval(id) }
-  }, [panel.open, panel.activeChildId, props.store])
+  }, [shown, panel.activeChildId, props.store])
 
   /**
    * Send the composer. While the side chat runs, the default pushes the

@@ -237,6 +237,15 @@ export interface SideCreateAgentOptions {
 export interface SideAgentsService {
   get(id: string): SideAgent | undefined
   create(options: SideCreateAgentOptions): Promise<SideAgentHandle>
+  /** Rebuild a live agent on a persisted session (absent on very old hosts). */
+  resume?(options: SideResumeAgentOptions): Promise<SideAgentHandle>
+}
+
+/** `ctx.agents.resume` options (mirror of ResumeAgentOptions). */
+export interface SideResumeAgentOptions {
+  resumeSessionId: string
+  agentOptions?: SideAgentOptions
+  setup?: (agentCtx: Context) => void | Promise<void>
 }
 
 /** Live provider / model / reasoning-effort selection for one agent. */
