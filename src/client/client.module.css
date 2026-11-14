@@ -396,8 +396,109 @@
 
 .panelListActions {
   display: flex;
-  justify-content: flex-end;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
   padding: 0 2px 2px;
+}
+
+.panelListExpanded {
+  max-height: 55vh;
+}
+
+.panelListPast {
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  padding: 2px 6px;
+  cursor: pointer;
+}
+
+.panelListPast:hover,
+.panelListPast[aria-pressed='true'] {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.pastList {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pastTitle {
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-tertiary);
+  padding: 2px 8px 4px;
+}
+
+.pastRow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 8px;
+  border-radius: 8px;
+}
+
+.pastRow:hover {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.pastText {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.pastLabel {
+  font-size: 13px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pastMeta {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--dsw-alias-label-tertiary);
+}
+
+.pastStatus[data-status='orphan'],
+.pastStatus[data-status='earlier'] {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.pastOpen {
+  flex: none;
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l1);
+  border-radius: 6px;
+  padding: 2px 8px;
+  cursor: pointer;
+}
+
+.pastOpen:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.pastOpen:disabled {
+  opacity: 0.5;
+  cursor: default;
 }
 
 .panelListDeleteAll {

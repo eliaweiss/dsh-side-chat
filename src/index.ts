@@ -17,8 +17,8 @@
  * or trusted authority; cross-site markers refuse).
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname } from 'node:path'
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname, join } from 'node:path'
 import * as agentApi from '@deepseek-ai/dsh-agent'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { SettingsConflictError } from '@deepseek-ai/dsh-settings'
@@ -184,6 +184,100 @@ async function writeRecords(records: StoredRecord[]): Promise<void> {
   const path = recordFilePath()
   await mkdir(dirname(path), { recursive: true })
   await writeFile(path, JSON.stringify(records, null, 2), 'utf8')
+}
+
+/**
+ * Conversation lineage: when another plugin replaces a conversation with a new
+ * session (dsh-message-rewind forks or recreates it on edit/delete and then
+ * deletes the source), the side chats move to the successor and the step is
+ * remembered here, so "past side chats" can also find side chats that were
+ * closed under an earlier version of the same conversation.
+ */
+const LINEAGE_FILE = 'dsh-side-chat-lineage.json'
+
+/** One replaced → successor step. */
+interface LineageStep {
+  from: string
+  to: string
+  at: number
+}
+
+/** Event other plugins emit when a conversation is replaced by a new session. */
+export const REWOUND_EVENT = 'message-rewind/rewound'
+
+/** Read the lineage steps (absent/malformed → empty). */
+async function readLineage(): Promise<LineageStep[]> {
+  try {
+    const parsed = JSON.parse(await readFile(dshHomePath(LINEAGE_FILE), 'utf8')) as unknown
+    if (!Array.isArray(parsed)) return []
+    return parsed.filter((s): s is LineageStep => {
+      const r = s as Record<string, unknown> | null
+      return typeof r?.from === 'string' && typeof r?.to === 'string'
+    }).map((s) => ({ from: s.from, to: s.to, at: typeof s.at === 'number' ? s.at : 0 }))
+  } catch {
+    return []
+  }
+}
+
+/** Persist the lineage steps. */
+async function writeLineage(steps: LineageStep[]): Promise<void> {
+  const path = dshHomePath(LINEAGE_FILE)
+  await mkdir(dirname(path), { recursive: true })
+  await writeFile(path, JSON.stringify(steps, null, 2), 'utf8')
+}
+
+/** Side-chat session ids are minted as `subchat-<uuid>`; refuse anything else. */
+const SIDECHAT_ID = /^subchat-[0-9a-zA-Z]+(?:-[0-9a-zA-Z]+)*$/
+
+/**
+ * Scan the session store on disk: every side-chat session id and every
+ * session id present (a conversation whose directory is gone was deleted).
+ */
+async function scanSessionStore(): Promise<{ sidechatIds: string[]; existing: Set<string> }> {
+  const root = dshHomePath('sessions')
+  const sidechatIds: string[] = []
+  const existing = new Set<string>()
+  let entries
+  try {
+    entries = await readdir(root, { withFileTypes: true })
+  } catch {
+    return { sidechatIds, existing }
+  }
+  const visit = (name: string): void => {
+    existing.add(name)
+    if (SIDECHAT_ID.test(name)) sidechatIds.push(name)
+  }
+  for (const entry of entries) {
+    if (!entry.isDirectory()) continue
+    if (entry.name.startsWith('session-') || entry.name.startsWith('subchat-')) {
+      visit(entry.name)
+      continue
+    }
+    let inner
+    try {
+      inner = await readdir(join(root, entry.name), { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const child of inner) if (child.isDirectory()) visit(child.name)
+  }
+  return { sidechatIds, existing }
+}
+
+/** One row of the "all past side chats" view. */
+interface PastItem {
+  childId: string
+  name?: string
+  createdAt: number
+  /** First prompt of the side chat (trimmed), to recognize it. */
+  preview: string
+  /**
+   * `listed`: already in this conversation's list. `closed`: removed from the
+   * list earlier (its log is kept). `earlier`: started under an earlier version
+   * of this conversation (before an edit/rewind). `orphan`: its conversation
+   * was deleted and no successor is known.
+   */
+  status: 'listed' | 'closed' | 'earlier' | 'orphan'
 }
 
 /** Browser-submitted prompt content part (text or base64 image). */
@@ -962,6 +1056,182 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     return { accepted: true }
   }
 
+  /**
+   * Conversation lineage (replaced → successor), loaded once and appended to
+   * on every reparent. Writes run one at a time in call order.
+   */
+  let lineage: LineageStep[] = []
+  const lineageLoaded: Promise<void> = readLineage().then((steps) => { lineage = steps }, () => {})
+  let lineageChain: Promise<void> = lineageLoaded
+  const persistLineage = (): void => {
+    lineageChain = lineageChain.then(() => writeLineage(lineage)).catch((error: unknown) => {
+      console.warn('[dsh-side-chat] lineage write failed:', error instanceof Error ? error.message : String(error))
+    })
+  }
+
+  /**
+   * Move every side chat of one conversation to its successor. A conversation
+   * edit/rewind (dsh-message-rewind) replaces the conversation with a NEW
+   * session and deletes the old one, so without this the side chats stayed
+   * keyed to a deleted id and vanished from the panel.
+   *
+   * The map updates are synchronous, so a list request that arrives right
+   * after the replacement already sees the moved side chats. An idle live side
+   * chat is put to sleep (agent disposed, log kept) so its next message
+   * resumes it composed from the successor instead of the dying conversation;
+   * one with a turn in flight keeps running and simply changes owner.
+   */
+  const reparent = async (payload: unknown): Promise<{ moved: number }> => {
+    const from = requireString(payload, 'fromSessionId')
+    const to = requireString(payload, 'toSessionId')
+    if (from === to) return { moved: 0 }
+    await loaded
+    let moved = 0
+    const sleeping: SidechatRecord[] = []
+    for (const record of sideChats.values()) {
+      if (record.parentSessionId !== from) continue
+      record.parentSessionId = to
+      moved += 1
+      const status = (record.handle.agent as { status?: string }).status
+      if (record.pendingTurns === 0 && status !== 'running') sleeping.push(record)
+    }
+    for (const record of dormant.values()) {
+      if (record.parentSessionId !== from) continue
+      record.parentSessionId = to
+      moved += 1
+    }
+    for (const record of sleeping) {
+      sideChats.delete(record.childId)
+      dormant.set(record.childId, {
+        childId: record.childId,
+        parentSessionId: to,
+        createdAt: record.createdAt,
+        ...(record.name === undefined ? {} : { name: record.name }),
+      })
+    }
+    persist()
+    await lineageLoaded
+    lineage.push({ from, to, at: Date.now() })
+    persistLineage()
+    for (const record of sleeping) {
+      try {
+        await record.handle.dispose()
+      } catch (error) {
+        console.warn('[dsh-side-chat] dispose on reparent failed:', error instanceof Error ? error.message : String(error))
+      }
+      void archiveChild(record.childId)
+    }
+    return { moved }
+  }
+
+  /** Header + first prompt of one side-chat session (never changes; cached). */
+  const headerCache = new Map<string, { parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null>()
+  const sidechatHeader = async (childId: string): Promise<{ parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null> => {
+    const cached = headerCache.get(childId)
+    if (cached !== undefined) return cached
+    let value: { parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null
+    try {
+      const read = await ctx.sessionQuery.readSession(childId)
+      const header = read.session
+      const firstUser = foldTranscript(read.events).find((m) => m.role === 'user')
+      const text = firstUser?.blocks.map((b) => (b.type === 'text' ? b.text : '')).join(' ') ?? ''
+      value = {
+        ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
+        ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
+        createdAt: typeof header.createdAt === 'number' ? header.createdAt : (read.events[0]?.time ?? 0),
+        preview: text.replace(/\s+/g, ' ').trim().slice(0, 160),
+      }
+    } catch {
+      value = null
+    }
+    // An unreadable session may still be mid-creation: only cache good reads.
+    if (value !== null) headerCache.set(childId, value)
+    return value
+  }
+
+  /**
+   * Every side chat ever started for one conversation, including the ones
+   * closed from the list, the ones started under earlier versions of it
+   * (before an edit/rewind), and orphans whose conversation was deleted with no
+   * known successor (from the same folder) so they can be brought back.
+   */
+  const past = async (payload: unknown): Promise<{ items: PastItem[] }> => {
+    const parentSessionId = requireString(payload, 'parentSessionId')
+    await loaded
+    await lineageLoaded
+    // Earlier versions of this conversation: walk the lineage backwards.
+    const versions = new Set<string>([parentSessionId])
+    for (let grew = true; grew;) {
+      grew = false
+      for (const step of lineage) {
+        if (versions.has(step.to) && !versions.has(step.from)) {
+          versions.add(step.from)
+          grew = true
+        }
+      }
+    }
+    const succeeded = new Set(lineage.map((step) => step.from))
+    const parentCwd = ctx.agents.get(parentSessionId)?.session.header.cwd
+    const { sidechatIds, existing } = await scanSessionStore()
+    const recordOf = (childId: string): { parentSessionId: string; name?: string; createdAt: number } | undefined =>
+      sideChats.get(childId) ?? dormant.get(childId)
+    const items: PastItem[] = []
+    for (const childId of sidechatIds) {
+      const header = await sidechatHeader(childId)
+      if (header === null) continue
+      const record = recordOf(childId)
+      const name = record?.name
+      const base = {
+        childId,
+        ...(name === undefined ? {} : { name }),
+        createdAt: record?.createdAt || header.createdAt,
+        preview: header.preview,
+      }
+      if (record !== undefined) {
+        if (record.parentSessionId === parentSessionId) {
+          items.push({ ...base, status: 'listed' })
+          continue
+        }
+        // Listed under a deleted conversation that has no known successor.
+        const gone = !existing.has(record.parentSessionId) && !succeeded.has(record.parentSessionId)
+        if (gone && (parentCwd === undefined || header.cwd === parentCwd)) items.push({ ...base, status: 'orphan' })
+        continue
+      }
+      const owner = header.parentSessionId
+      if (owner === undefined) continue
+      if (owner === parentSessionId) {
+        items.push({ ...base, status: 'closed' })
+      } else if (versions.has(owner)) {
+        items.push({ ...base, status: 'earlier' })
+      } else if (!existing.has(owner) && !succeeded.has(owner) && (parentCwd === undefined || header.cwd === parentCwd)) {
+        items.push({ ...base, status: 'orphan' })
+      }
+    }
+    items.sort((a, b) => b.createdAt - a.createdAt)
+    return { items }
+  }
+
+  /** Put one past side chat (closed, earlier, or orphaned) back into a conversation's list. */
+  const reopen = async (payload: unknown): Promise<{ accepted: true }> => {
+    const childId = requireString(payload, 'childId')
+    const parentSessionId = requireString(payload, 'parentSessionId')
+    if (!SIDECHAT_ID.test(childId)) throw new SidechatError('bad-request', 'not a side-chat id')
+    await loaded
+    const live = sideChats.get(childId)
+    if (live !== undefined) {
+      live.parentSessionId = parentSessionId
+    } else {
+      const header = await sidechatHeader(childId)
+      if (header === null) throw new SidechatError('not-found', `side chat "${childId}" not found`, 404)
+      const stub = dormant.get(childId)
+      if (stub !== undefined) stub.parentSessionId = parentSessionId
+      else dormant.set(childId, { childId, parentSessionId, createdAt: header.createdAt || Date.now() })
+    }
+    persist()
+    void archiveChild(childId)
+    return { accepted: true }
+  }
+
   /** Summarize one piece of text with the side chat's (inherited) model. */
   const summarize = async (payload: unknown): Promise<{ summary: string }> => {
     const parentSessionId = requireString(payload, 'parentSessionId')
@@ -1137,6 +1407,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     'sidechat.state': state,
     'sidechat.dispose': dispose,
     'sidechat.rename': rename,
+    'sidechat.reparent': reparent,
+    'sidechat.past': past,
+    'sidechat.reopen': reopen,
     // Side-chat preferences (settings service optional; absent → undefined).
     'settings.get': () => {
       const settings = getSettings()
@@ -1297,6 +1570,18 @@ export function apply(ctx: Context): void {
   })
 
   const api = buildApi(ctx, sideChats, () => settingsFace)
+
+  // dsh-message-rewind replaces a conversation with a new session on edit /
+  // delete-message and then deletes the old one: carry its side chats over.
+  if (typeof ctx.on === 'function') ctx.effect(() => ctx.on(REWOUND_EVENT, (event: unknown) => {
+    const data = event as { sourceSessionId?: unknown; sessionId?: unknown } | null
+    const from = data?.sourceSessionId
+    const to = data?.sessionId
+    if (typeof from !== 'string' || typeof to !== 'string' || from === '' || to === '') return
+    void api['sidechat.reparent']({ fromSessionId: from, toSessionId: to }).catch((error: unknown) => {
+      console.warn('[dsh-side-chat] reparent failed:', error instanceof Error ? error.message : String(error))
+    })
+  }), 'dsh-side-chat: follow rewound conversations')
 
   // Tear every live side chat down with the plugin fiber, and put back the
   // archive of any chat that was mid-turn (a live turn is lifted from the

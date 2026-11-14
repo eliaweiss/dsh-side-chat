@@ -41,6 +41,7 @@ export interface SideWebServer {
 export interface SideSessionHeader {
   cwd?: string
   parentSession?: string
+  createdAt?: number
   origin?: 'subagent'
   delegationDepth?: number
 }

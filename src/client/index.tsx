@@ -5,7 +5,7 @@
  * section. The panel is isolated per current conversation and talks to the
  * host /sidechat API.
  */
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type MouseEvent as ReactMouseEvent, type ReactElement } from 'react'
 import { useSyncExternalStore } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import {
@@ -42,6 +42,7 @@ import {
   type SidechatImageRef,
   type SidechatListItem,
   type SidechatMessage,
+  type SidechatPastItem,
   type SidechatPermissions,
 } from './api.ts'
 import { en, LOCALE_NS, zh, type SidechatLocaleKey } from './locales.ts'
@@ -84,6 +85,8 @@ interface PanelState {
   planPending: boolean
   goalObjective: string | null
   error: string | null
+  /** The list area shows every past side chat of this conversation instead of the live list. */
+  pastOpen: boolean
 }
 
 /**
@@ -175,6 +178,7 @@ function emptyPanel(): PanelState {
     planPending: false,
     goalObjective: null,
     error: null,
+    pastOpen: false,
   }
 }
 
@@ -572,6 +576,96 @@ function SidechatListRow(props: {
         ×
       </button>
     </div>
+  )
+}
+
+/**
+ * Every side chat ever started for this conversation: the listed ones, the
+ * ones closed from the list (their log is kept), the ones started under an
+ * earlier version of the conversation (before a message edit/rewind), and
+ * orphans whose conversation was deleted. Picking one brings it back into the
+ * list and opens it.
+ */
+function PastSideChats(props: {
+  parentSessionId: string
+  t: (key: SidechatLocaleKey) => string
+  onOpen: (item: SidechatPastItem) => void
+}) {
+  const { t } = props
+  const [items, setItems] = useState<SidechatPastItem[] | null>(null)
+  const [error, setError] = useState<string | null>(null)
+  const [busy, setBusy] = useState<string | null>(null)
+
+  useEffect(() => {
+    let cancelled = false
+    setItems(null)
+    setError(null)
+    void api.past({ parentSessionId: props.parentSessionId }).then((result) => {
+      if (cancelled) return
+      if (result.ok) setItems(result.value.items)
+      else setError(result.error.message)
+    })
+    return () => { cancelled = true }
+  }, [props.parentSessionId])
+
+  if (error !== null) return <div className={css.panelEmpty} data-testid="sidechat-past-error">{error}</div>
+  if (items === null) return <div className={css.panelEmpty} data-testid="sidechat-past-loading">{t('past.loading')}</div>
+  if (items.length === 0) return <div className={css.panelEmpty} data-testid="sidechat-past-empty">{t('past.empty')}</div>
+  return (
+    <div className={css.pastList} data-testid="sidechat-past-list">
+      <div className={css.pastTitle}>{t('past.title')}</div>
+      {items.map((item) => {
+        const label = item.name ?? (item.preview !== '' ? item.preview : item.childId)
+        const when = item.createdAt > 0 ? new Date(item.createdAt).toLocaleString() : ''
+        return (
+          <div key={item.childId} className={css.pastRow} data-testid="sidechat-past-row" data-status={item.status}>
+            <div className={css.pastText} title={`${label}\n${item.childId}`}>
+              <span className={css.pastLabel}>{label}</span>
+              <span className={css.pastMeta}>
+                <span className={css.pastStatus} data-status={item.status}>{t(`past.status.${item.status}` as SidechatLocaleKey)}</span>
+                {when !== '' && <span>{when}</span>}
+              </span>
+            </div>
+            <button
+              type="button"
+              className={css.pastOpen}
+              disabled={busy !== null}
+              data-testid="sidechat-past-open"
+              onClick={() => {
+                setBusy(item.childId)
+                props.onOpen(item)
+              }}
+            >
+              {item.status === 'listed' ? t('past.open') : t('past.restore')}
+            </button>
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+/** The client command surface (`ctx.commandUi`, dsh-client-ui-commands), as much as this plugin uses. */
+interface SideCommandUi {
+  register(contribution: {
+    name: string
+    label?(): string
+    description?(): string
+    icon?: (props: { size?: number | undefined; className?: string | undefined }) => ReactElement
+    available(session: { sessionId: string }): boolean
+    ui: { kind: 'action'; run(session: { sessionId: string }): void }
+  }): () => void
+}
+
+/** + menu glyph: a chat bubble beside a side panel. */
+function SidechatMenuIcon(props: { size?: number | undefined; className?: string | undefined }) {
+  const size = props.size ?? 20
+  return (
+    <svg width={size} height={size} viewBox="0 0 20 20" fill="none" className={props.className} aria-hidden="true">
+      <rect x="2.5" y="3.5" width="15" height="13" rx="2.5" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M12.5 3.5v13" stroke="currentColor" strokeWidth="1.4" />
+      <path d="M5.5 8h4M5.5 11h2.5" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" />
+    </svg>
   )
 }
 
@@ -1804,6 +1898,24 @@ function SidechatPanel(props: {
     })
   }, [panel.parentSessionId, props.store])
 
+  /** Bring one past side chat back into this conversation's list and open it. */
+  const openPast = useCallback((item: SidechatPastItem) => {
+    const parentSessionId = panel.parentSessionId
+    void (async () => {
+      if (item.status !== 'listed') {
+        const result = await api.reopen({ childId: item.childId, parentSessionId })
+        if (!result.ok) {
+          props.store.patch({ error: `${props.t('past.failed')}: ${result.error.message}` })
+          return
+        }
+      }
+      await refreshList(props.store, parentSessionId)
+      props.store.setActive(item.childId)
+      props.store.patch({ pastOpen: false })
+      void refreshHistory(props.store, item.childId)
+    })()
+  }, [panel.parentSessionId, props.store, props.t])
+
   /** Delete every side chat of this conversation at once. */
   const disposeAll = useCallback(() => {
     const ids = panel.items.map((i) => i.childId)
@@ -2090,16 +2202,29 @@ function SidechatPanel(props: {
         )
       })()}
 
-      <div className={css.panelList}>
-        {panel.items.length === 0
+      <div className={`${css.panelList} ${panel.pastOpen ? css.panelListExpanded : ''}`} data-testid="sidechat-list">
+        <div className={css.panelListActions}>
+          <button
+            type="button"
+            className={css.panelListPast}
+            data-testid="sidechat-past-toggle"
+            aria-pressed={panel.pastOpen}
+            onClick={() => { props.store.patch({ pastOpen: !panel.pastOpen }) }}
+          >
+            {panel.pastOpen ? props.t('past.hide') : props.t('past.show')}
+          </button>
+          {!panel.pastOpen && panel.items.length > 0 && (
+            <button type="button" className={css.panelListDeleteAll} data-testid="sidechat-delete-all" onClick={disposeAll}>
+              {props.t('panel.deleteAll')}
+            </button>
+          )}
+        </div>
+        {panel.pastOpen
+          ? <PastSideChats parentSessionId={panel.parentSessionId} t={props.t} onOpen={openPast} />
+          : panel.items.length === 0
           ? <div className={css.panelEmpty}>{props.t('panel.empty')}</div>
           : (
               <>
-                <div className={css.panelListActions}>
-                  <button type="button" className={css.panelListDeleteAll} onClick={disposeAll}>
-                    {props.t('panel.deleteAll')}
-                  </button>
-                </div>
                 {panel.items.map((item) => (
                   <SidechatListRow
                     key={item.childId}
@@ -2740,6 +2865,40 @@ export function apply(ctx: Context): void {
     return () => { offZh(); offEn(); offSub() }
   }, 'dsh-side-chat: dictionaries')
 
+  // "Side chat" row in the composer's + menu (and `/sidechat`): opens this
+  // conversation's side-chat panel. Optional — older DSH lines without the
+  // client command surface simply show no row.
+  ctx.inject(['commandUi'], (scope: Context) => {
+    const commandUi = (scope as unknown as { commandUi: SideCommandUi }).commandUi
+    scope.effect(() => commandUi.register({
+      name: 'sidechat',
+      label: () => translate(activeLocale, 'menu.label'),
+      description: () => translate(activeLocale, 'menu.description'),
+      icon: SidechatMenuIcon,
+      available: (session) => typeof session.sessionId === 'string' && session.sessionId !== '',
+      ui: {
+        kind: 'action',
+        run: (session) => {
+          const sessionId = session.sessionId
+          store.openPanel(sessionId)
+          void refreshList(store, sessionId).then(() => {
+            const panel = store.getSnapshot().panel
+            if (panel.parentSessionId !== sessionId || panel.activeChildId !== null) return
+            // Nothing selected yet: show the newest side chat, or the past list
+            // when this conversation has none listed (e.g. all were closed).
+            const newest = panel.items[panel.items.length - 1]
+            if (newest !== undefined) {
+              store.setActive(newest.childId)
+              void refreshHistory(store, newest.childId)
+            } else {
+              store.patch({ pastOpen: true })
+            }
+          })
+        },
+      },
+    }), 'dsh-side-chat: + menu entry')
+  })
+
   // Selection popup + right-click menu on chat text, through DSH's own
   // text-interaction surface (so the built-in "Quote text" stays available).
   const uiConversation = ctx.get('uiConversation') as {
@@ -2806,9 +2965,22 @@ export function apply(ctx: Context): void {
       const next = currentSessionId()
       if (next === lastId) return
       lastId = next
+      // The panel of the conversation being left: when its side chats moved to
+      // the next one (a message edit/rewind replaces the conversation with a
+      // new session), the panel follows them instead of resetting.
+      const previous = store.getSnapshot().panel
       store.setCurrent(next)
       if (next === undefined) return
-      void refreshList(store, next)
+      void refreshList(store, next).then(() => {
+        const now = store.getSnapshot()
+        if (now.current !== next || now.panel.activeChildId !== null) return
+        const carried = previous.activeChildId
+        if (carried === null || !now.panel.items.some((i) => i.childId === carried)) return
+        store.setActive(carried)
+        store.patch({ lookup: previous.lookup, provider: previous.provider, model: previous.model, effort: previous.effort, preset: previous.preset, draft: previous.draft })
+        if (previous.open) store.openPanel(next)
+        void refreshHistory(store, carried)
+      })
       const panel = store.getSnapshot().panel
       if (panel.open && panel.activeChildId !== null) {
         void refreshHistory(store, panel.activeChildId)
