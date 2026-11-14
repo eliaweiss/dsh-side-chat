@@ -1766,7 +1766,9 @@ function SidechatPanel(props: {
    */
   const send = useCallback((runningMode: 'queue' | 'steer' = 'steer') => {
     const draft = panel.draft.trim()
-    const attachment = panel.attachment === null || panel.attachment.trim() === '' ? '' : toBlockquote(panel.attachment.trim())
+    // The highlighted text staged as a quote; a new side chat is named after it.
+    const quoted = panel.attachment === null ? '' : panel.attachment.trim()
+    const attachment = quoted === '' ? '' : toBlockquote(quoted)
     const text = attachment === '' ? draft : (draft === '' ? attachment : `${attachment}\n\n${draft}`)
     void serializeImages(panel.attachments).then((imageParts) => {
       const content: PromptContentPart[] = [...imageParts, ...(text === '' ? [] : [{ type: 'text', text }] as PromptContentPart[])]
@@ -1784,6 +1786,7 @@ function SidechatPanel(props: {
           ...(panel.model !== '' ? { model: panel.model } : {}),
           ...(panel.effort !== '' ? { reasoningEffort: panel.effort } : {}),
           ...(panel.preset !== '' ? { preset: panel.preset } : {}),
+          ...(quoted !== '' ? { name: quoted } : {}),
         }).then((result) => {
           if (result.ok) {
             props.store.setActive(result.value.childId)

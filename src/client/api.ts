@@ -75,7 +75,8 @@ async function call<T>(method: string, payload: Record<string, unknown>): Promis
 }
 
 export const api = {
-  start: (args: { parentSessionId: string; content: PromptContentPart[]; lookupEnabled: boolean; provider?: string; model?: string; reasoningEffort?: string; preset?: string }) =>
+  /** Start a side chat; `name` (the highlighted text it was started from) names it in the list. */
+  start: (args: { parentSessionId: string; content: PromptContentPart[]; lookupEnabled: boolean; provider?: string; model?: string; reasoningEffort?: string; preset?: string; name?: string }) =>
     call<{ childId: string; provider: string; model: string; reasoningEffort?: string }>('sidechat.start', args),
   followup: (args: { childId: string; content: PromptContentPart[]; lookupEnabled: boolean }) =>
     call<{ accepted: true }>('sidechat.followup', args),

@@ -799,7 +799,11 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     // persisted record) behind for a request that never ran.
     const blocks = await durableContent(content, lookupEnabled)
 
-    const record = payload as { provider?: unknown; model?: unknown; reasoningEffort?: unknown; preset?: unknown }
+    const record = payload as { provider?: unknown; model?: unknown; reasoningEffort?: unknown; preset?: unknown; name?: unknown }
+    // The highlighted text a side chat was started from names it; without one
+    // the list shows the side chat by its id.
+    if (record.name !== undefined && typeof record.name !== 'string') throw new SidechatError('bad-request', '"name" must be a string')
+    const name = normalizeName(record.name)
     const inherited = parentRoute(parent)
     const parentConfig = parent.session.requestHeader?.()?.config
     // A client-supplied selection wins over the inherited one (lets the user
@@ -861,6 +865,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       handle,
       selection,
       createdAt: Date.now(),
+      ...(name === undefined ? {} : { name }),
       pendingTurns: 0,
     }
     sideChats.set(childId, child)

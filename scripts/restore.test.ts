@@ -177,3 +177,26 @@ test('ending a side chat from an earlier run forgets it; a deleted session is dr
   const third = mount()
   expect((await third.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([])
 })
+
+test('a side chat started from highlighted text is named after it, across a restart', async () => {
+  const first = mount()
+  const quoted = (await first.call('sidechat.start', {
+    parentSessionId: 'parent-1',
+    content: [{ type: 'text', text: '> The office dog\n> is named Max.\n\nWhy Max?' }],
+    name: '  The office dog\n  is named Max.  ',
+  })).body.value.childId
+  const plain = (await first.call('sidechat.start', { parentSessionId: 'parent-1', content: [{ type: 'text', text: 'no quote' }] })).body.value.childId
+  expect((await first.call('sidechat.start', { parentSessionId: 'parent-1', content: [{ type: 'text', text: 'x' }], name: 42 })).status).toBe(400)
+  expect((await first.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([
+    { childId: quoted, name: 'The office dog is named Max.', running: false },
+    { childId: plain, running: false },
+  ])
+  await flush()
+  first.unload()
+
+  const second = mount()
+  expect((await second.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([
+    { childId: quoted, name: 'The office dog is named Max.', running: false },
+    { childId: plain, running: false },
+  ])
+})
