@@ -119,6 +119,8 @@ interface SidechatRecord {
   /** Live selection coupled to the agent; mutated by `sidechat.selectModel`. */
   selection: SideModelSelectionRef
   createdAt: number
+  /** User-given display name (absent = shown by its id). */
+  name?: string
   /**
    * Deliveries whose turn has not settled yet. The session stays unarchived
    * while this is non-zero and is archived again when it reaches zero, so a
@@ -140,6 +142,18 @@ interface StoredRecord {
   childId: string
   parentSessionId: string
   createdAt: number
+  /** User-given display name (absent = shown by its id). */
+  name?: string
+}
+
+/** Longest side-chat name kept (longer names are cut). */
+const MAX_NAME_LENGTH = 200
+
+/** Normalize a user-given side-chat name: one line, trimmed, capped; empty → undefined. */
+function normalizeName(raw: unknown): string | undefined {
+  if (typeof raw !== 'string') return undefined
+  const name = raw.replace(/\s+/g, ' ').trim().slice(0, MAX_NAME_LENGTH).trim()
+  return name === '' ? undefined : name
 }
 
 /** Read the durable side-chat record list (absent/malformed → empty). */
@@ -148,21 +162,25 @@ async function readRecords(): Promise<StoredRecord[]> {
     const raw = await readFile(recordFilePath(), 'utf8')
     const parsed = JSON.parse(raw) as unknown
     if (!Array.isArray(parsed)) return []
-    return parsed.filter((entry): entry is { childId: string; parentSessionId: string; createdAt: number } => {
+    return parsed.filter((entry): entry is { childId: string; parentSessionId: string; createdAt: number; name?: unknown } => {
       const record = entry as Record<string, unknown> | null
       return typeof record?.childId === 'string' && typeof record?.parentSessionId === 'string'
-    }).map((entry) => ({
-      childId: entry.childId,
-      parentSessionId: entry.parentSessionId,
-      createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : 0,
-    }))
+    }).map((entry) => {
+      const name = normalizeName(entry.name)
+      return {
+        childId: entry.childId,
+        parentSessionId: entry.parentSessionId,
+        createdAt: typeof entry.createdAt === 'number' ? entry.createdAt : 0,
+        ...(name === undefined ? {} : { name }),
+      }
+    })
   } catch {
     return []
   }
 }
 
 /** Persist the live side-chat record list (the "record" a future cleanup consumes). */
-async function writeRecords(records: Array<{ childId: string; parentSessionId: string; createdAt: number }>): Promise<void> {
+async function writeRecords(records: StoredRecord[]): Promise<void> {
   const path = recordFilePath()
   await mkdir(dirname(path), { recursive: true })
   await writeFile(path, JSON.stringify(records, null, 2), 'utf8')
@@ -303,6 +321,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         childId: record.childId,
         parentSessionId: record.parentSessionId,
         createdAt: record.createdAt,
+        ...(record.name === undefined ? {} : { name: record.name }),
       }))
       for (const record of dormant.values()) {
         if (!sideChats.has(record.childId)) records.push(record)
@@ -651,6 +670,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         handle,
         selection,
         createdAt: stub.createdAt,
+        ...(stub.name === undefined ? {} : { name: stub.name }),
         pendingTurns: 0,
       }
       sideChats.set(childId, record)
@@ -782,9 +802,9 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   const steer = (payload: unknown): Promise<{ accepted: true }> => deliverLater(payload, 'steer')
 
   /** List the side chats launched by one parent conversation. */
-  const list = async (payload: unknown): Promise<{ items: Array<{ childId: string; running: boolean; runningSince?: number }> }> => {
+  const list = async (payload: unknown): Promise<{ items: Array<{ childId: string; name?: string; running: boolean; runningSince?: number }> }> => {
     const parentSessionId = requireString(payload, 'parentSessionId')
-    const items: Array<{ childId: string; running: boolean; runningSince?: number }> = []
+    const items: Array<{ childId: string; name?: string; running: boolean; runningSince?: number }> = []
     for (const record of sideChats.values()) {
       if (record.parentSessionId !== parentSessionId) continue
       const agent = record.handle.agent
@@ -803,6 +823,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       const runningSince = running ? (eventRunningSince ?? Date.now()) : undefined
       items.push({
         childId: record.childId,
+        ...(record.name === undefined ? {} : { name: record.name }),
         running,
         ...(runningSince !== undefined ? { runningSince } : {}),
       })
@@ -811,7 +832,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     await loaded
     for (const record of dormant.values()) {
       if (record.parentSessionId !== parentSessionId || sideChats.has(record.childId)) continue
-      items.push({ childId: record.childId, running: false })
+      items.push({ childId: record.childId, ...(record.name === undefined ? {} : { name: record.name }), running: false })
     }
     const createdAt = (id: string): number => sideChats.get(id)?.createdAt ?? dormant.get(id)?.createdAt ?? 0
     items.sort((a, b) => createdAt(a.childId) - createdAt(b.childId))
@@ -901,6 +922,25 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     const session = sessionOf(childId)
     ctx.permissionPresets.set(session, presetName)
     return { accepted: true }
+  }
+
+  /**
+   * Rename one side chat (live or dormant). An empty name clears it, so the
+   * list shows the side chat by its id again. The name lives in the record
+   * file only; the hidden session itself is untouched.
+   */
+  const rename = async (payload: unknown): Promise<{ name?: string }> => {
+    const childId = requireString(payload, 'childId')
+    const raw = (payload as Record<string, unknown> | null)?.name
+    if (raw !== undefined && typeof raw !== 'string') throw new SidechatError('bad-request', '"name" must be a string')
+    const name = normalizeName(raw)
+    await loaded
+    const target: { name?: string } | undefined = sideChats.get(childId) ?? dormant.get(childId)
+    if (target === undefined) throw new SidechatError('not-found', `side chat "${childId}" not found`, 404)
+    if (name === undefined) delete target.name
+    else target.name = name
+    persist()
+    return name === undefined ? {} : { name }
   }
 
   /** Close one side chat (tears down its agent and session). */
@@ -1096,6 +1136,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     'sidechat.command': command,
     'sidechat.state': state,
     'sidechat.dispose': dispose,
+    'sidechat.rename': rename,
     // Side-chat preferences (settings service optional; absent → undefined).
     'settings.get': () => {
       const settings = getSettings()

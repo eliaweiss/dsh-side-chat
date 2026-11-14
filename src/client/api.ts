@@ -16,6 +16,8 @@ export type SidechatResult<T> = { ok: true; value: T } | { ok: false; error: Sid
 /** Side-chat list row. */
 export interface SidechatListItem {
   childId: string
+  /** User-given display name (absent = shown by its id). */
+  name?: string
   running: boolean
   runningSince?: number
 }
@@ -111,4 +113,7 @@ export const api = {
     call<{ value?: unknown; revision?: number }>('settings.update', { patch, expectedRevision }),
   dispose: (args: { childId: string }) =>
     call<{ accepted: true }>('sidechat.dispose', args),
+  /** Rename one side chat; an empty name clears it. */
+  rename: (args: { childId: string; name: string }) =>
+    call<{ name?: string }>('sidechat.rename', args),
 }

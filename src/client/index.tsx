@@ -14,6 +14,7 @@ import {
   IconChevronDownOutlineRegular,
   IconChevronRightOutlineRegular,
   IconCopyOutlineRegular,
+  IconEditOutlineRegular,
   IconPanelLeftOutlineRegular,
   IconSendOutlineRegular,
   IconStopFillRegular,
@@ -85,6 +86,24 @@ interface PanelState {
   error: string | null
 }
 
+/**
+ * The pending `ask_user_question` of the ACTIVE side chat, with the carrier
+ * that answers it. The side panel owns its own composer, so the host's
+ * `conversation.composer` question card (which only renders for the main
+ * conversation) never reaches it: without this the side agent's question
+ * blocked its turn until the user aborted it. Null = no pending question.
+ */
+interface SideQuestionRequest {
+  /** The child session the question belongs to. */
+  childId: string
+  /** Render identity of the pending request (carrier key). */
+  key: string
+  /** The question batch to answer. */
+  questions: SideQuestionItem[]
+  /** Submit the whole batch through the carrier's live channel. */
+  answer(batch: { answers: Array<{ id: string; selected: string[]; custom?: string }> }): Promise<void>
+}
+
 /** The whole browser-side snapshot. */
 interface SidechatSnapshot {
   current: string | undefined
@@ -93,6 +112,8 @@ interface SidechatSnapshot {
   prefs: SubchatPrefs
   /** The current main conversation's pending user-question dialog (null = none). */
   mainQuestion: SideQuestionItem[] | null
+  /** The active side chat's own pending question (null = none). */
+  sideQuestion: SideQuestionRequest | null
   /** Question ids the user deleted from the panel list. */
   dismissedQuestionIds: string[]
   /**
@@ -111,6 +132,15 @@ interface SidechatStore {
   setAnchor(anchor: SelectionAnchor | null): void
   setPrefs(prefs: SubchatPrefs): void
   setMainQuestion(questions: SideQuestionItem[] | null): void
+  /** Publish (or clear) the active side chat's own pending question. */
+  setSideQuestion(request: SideQuestionRequest | null): void
+  /**
+   * Retire one answered question key: clears the card and refuses to show that
+   * same request again. The host keeps the call listed until its tool result
+   * lands, so without this the tracking effect re-published the question the
+   * instant it was answered.
+   */
+  settleSideQuestion(key: string): void
   dismissQuestion(id: string): void
   dismissAllQuestions(ids: string[]): void
   openPanel(parentSessionId: string): void
@@ -155,6 +185,9 @@ function createStore(): SidechatStore {
   let anchor: SelectionAnchor | null = null
   let prefs: SubchatPrefs = { ...SUBCHAT_PREFS_DEFAULTS }
   let mainQuestion: SideQuestionItem[] | null = null
+  let sideQuestion: SideQuestionRequest | null = null
+  /** Request keys already answered from this panel; they never come back. */
+  const answeredQuestionKeys = new Set<string>()
   let dismissedQuestionIds: string[] = []
   // Optimistic until the dock effect has inspected the services: a deployment
   // whose sidebar services are missing flips this to false and the panel
@@ -170,10 +203,10 @@ function createStore(): SidechatStore {
   let dockLaunch: (() => void) | null = null
   // Cached snapshot: useSyncExternalStore compares identity, so the object is
   // only rebuilt on a mutation — never inside getSnapshot itself.
-  let snapshot: SidechatSnapshot = { current, panel, anchor, prefs, mainQuestion, dismissedQuestionIds, dockAvailable }
+  let snapshot: SidechatSnapshot = { current, panel, anchor, prefs, mainQuestion, sideQuestion, dismissedQuestionIds, dockAvailable }
 
   const notify = (): void => {
-    snapshot = { current, panel, anchor, prefs, mainQuestion, dismissedQuestionIds, dockAvailable }
+    snapshot = { current, panel, anchor, prefs, mainQuestion, sideQuestion, dismissedQuestionIds, dockAvailable }
     for (const fn of [...listeners]) fn()
   }
 
@@ -192,6 +225,7 @@ function createStore(): SidechatStore {
         : (bySession.get(next) ?? { ...emptyPanel(), parentSessionId: next, lookup: prefs.lookupDefault })
       anchor = null
       mainQuestion = null
+      sideQuestion = null
       dismissedQuestionIds = []
       notify()
     },
@@ -207,6 +241,22 @@ function createStore(): SidechatStore {
       mainQuestion = questions
       // Keep dismissal state: a dismissed question must not reappear just
       // because the pending snapshot re-publishes while the dialog is still open.
+      notify()
+    },
+    setSideQuestion(request) {
+      // An already-answered request never returns to the card.
+      if (request !== null && answeredQuestionKeys.has(request.key)) return
+      // Identity-compared by key: the carrier re-publishes on every countdown
+      // tick, and rebuilding the snapshot each second would re-render the
+      // whole transcript.
+      if (request?.key === sideQuestion?.key && request?.childId === sideQuestion?.childId) return
+      sideQuestion = request
+      notify()
+    },
+    settleSideQuestion(key) {
+      answeredQuestionKeys.add(key)
+      if (sideQuestion?.key !== key) return
+      sideQuestion = null
       notify()
     },
     dismissQuestion(id) {
@@ -402,6 +452,126 @@ function CopyReplyButton(props: { text: string; t: (key: SidechatLocaleKey) => s
         {copied ? <IconCheckOutlineRegular /> : <IconCopyOutlineRegular />}
       </button>
     </Tooltip>
+  )
+}
+
+/** The name a side chat is shown by: its user-given name, else its id. */
+function itemName(item: SidechatListItem): string {
+  return item.name ?? item.childId
+}
+
+/**
+ * One row of the side-chat list: select, copy its name, rename it in place
+ * (pencil or double-click; Enter/blur saves, Escape cancels, empty clears),
+ * and delete.
+ */
+function SidechatListRow(props: {
+  item: SidechatListItem
+  active: boolean
+  t: (key: SidechatLocaleKey) => string
+  onSelect: () => void
+  onRename: (name: string) => void
+  onDispose: () => void
+}) {
+  const { item, t } = props
+  const name = itemName(item)
+  const { copied, onCopy } = useCopyText(name)
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+  const inputRef = useRef<HTMLInputElement | null>(null)
+  /** Set once Enter/Escape settled the edit, so the blur that follows is a no-op. */
+  const settled = useRef(false)
+
+  const beginEdit = (): void => {
+    settled.current = false
+    setDraft(item.name ?? '')
+    setEditing(true)
+  }
+  const finish = (save: boolean): void => {
+    if (settled.current) return
+    settled.current = true
+    setEditing(false)
+    if (save && draft.trim() !== (item.name ?? '')) props.onRename(draft)
+  }
+
+  useEffect(() => {
+    if (!editing) return
+    inputRef.current?.focus()
+    inputRef.current?.select()
+  }, [editing])
+
+  const copyLabel = copied ? t('panel.nameCopied') : t('panel.copyName')
+  return (
+    <div className={css.panelListItemRow} data-testid="sidechat-list-row">
+      {editing
+        ? (
+            <input
+              ref={inputRef}
+              className={css.panelListItemRename}
+              data-testid="sidechat-rename-input"
+              value={draft}
+              maxLength={200}
+              placeholder={t('panel.renamePlaceholder')}
+              aria-label={t('panel.rename')}
+              onChange={(e) => { setDraft(e.target.value) }}
+              onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return
+                if (e.key === 'Enter') { e.preventDefault(); finish(true) }
+                else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); finish(false) }
+              }}
+              onBlur={() => { finish(true) }}
+            />
+          )
+        : (
+            <button
+              type="button"
+              className={`${css.panelListItem} ${props.active ? css.panelListItemActive : ''}`}
+              title={item.name === undefined ? name : `${name}\n${item.childId}`}
+              onClick={props.onSelect}
+              onDoubleClick={beginEdit}
+            >
+              <span className={css.panelListItemDot} data-running={item.running ? '1' : undefined} />
+              <span className={css.panelListItemLabel} data-named={item.name === undefined ? undefined : '1'}>{name}</span>
+            </button>
+          )}
+      {!editing && (
+        <>
+          <Tooltip label={copyLabel} side="bottom">
+            <button
+              type="button"
+              className={css.panelListItemAction}
+              aria-label={copyLabel}
+              data-testid="sidechat-copy-name"
+              data-copied={copied ? '1' : undefined}
+              onClick={onCopy}
+            >
+              {copied ? <IconCheckOutlineRegular /> : <IconCopyOutlineRegular />}
+            </button>
+          </Tooltip>
+          <Tooltip label={t('panel.rename')} side="bottom">
+            <button
+              type="button"
+              className={css.panelListItemAction}
+              aria-label={t('panel.rename')}
+              data-testid="sidechat-rename"
+              onClick={beginEdit}
+            >
+              <IconEditOutlineRegular />
+            </button>
+          </Tooltip>
+        </>
+      )}
+      <button
+        type="button"
+        className={css.panelListItemRemove}
+        aria-label={t('panel.delete')}
+        title={t('panel.delete')}
+        data-testid="sidechat-delete"
+        onClick={props.onDispose}
+      >
+        ×
+      </button>
+    </div>
   )
 }
 
@@ -1093,6 +1263,185 @@ function savedPanelWidth(): number | null {
   }
 }
 
+/**
+ * The side chat's own `ask_user_question` card.
+ *
+ * The host renders its question card into the `conversation.composer` slot,
+ * which exists only for the main conversation — so a question asked by a SIDE
+ * chat agent reached no surface and blocked the turn until it was aborted.
+ * This card gives the side panel the same answering surface: one batch over
+ * every question, single- or multi-select plus a free-text answer, Skip per
+ * question, and one submit through the carrier's live channel.
+ */
+function SideQuestionCard(props: {
+  request: SideQuestionRequest
+  t: (key: SidechatLocaleKey) => string
+  onSettled: () => void
+  onError: (message: string) => void
+}) {
+  const { request } = props
+  /** Selected option labels per question id. */
+  const [selected, setSelected] = useState<Record<string, string[]>>({})
+  /** Free-text answer per question id. */
+  const [custom, setCustom] = useState<Record<string, string>>({})
+  /** Question ids the user explicitly skipped. */
+  const [skipped, setSkipped] = useState<string[]>([])
+  const [submitting, setSubmitting] = useState(false)
+
+  // A new request (different key) starts from a clean draft. Options marked
+  // "(Recommended)" start selected, mirroring the host card's preselection.
+  useEffect(() => {
+    const preset: Record<string, string[]> = {}
+    for (const q of request.questions) {
+      const recommended = (q.options ?? [])
+        .filter((o) => /\(Recommended\)\s*$/i.test(o.label))
+        .map((o) => o.label)
+      if (recommended.length === 0) continue
+      preset[q.id] = q.multiSelect === true ? recommended : recommended.slice(0, 1)
+    }
+    setSelected(preset)
+    setCustom({})
+    setSkipped([])
+    setSubmitting(false)
+    // Keyed on the request identity ONLY. `request.questions` is a fresh array
+    // on every republish, so depending on it reset the draft (and cleared
+    // `submitting`) mid-submit. The card is also mounted under `key={key}`, so
+    // a different request gets a fresh component anyway.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request.key])
+
+  const toggle = (q: SideQuestionItem, label: string): void => {
+    setSkipped((s) => s.filter((id) => id !== q.id))
+    setSelected((prev) => {
+      const current = prev[q.id] ?? []
+      if (q.multiSelect === true) {
+        const next = current.includes(label) ? current.filter((l) => l !== label) : [...current, label]
+        return { ...prev, [q.id]: next }
+      }
+      // Single-select: clicking the chosen option again clears it.
+      return { ...prev, [q.id]: current[0] === label ? [] : [label] }
+    })
+  }
+
+  const skip = (q: SideQuestionItem): void => {
+    setSkipped((s) => (s.includes(q.id) ? s.filter((id) => id !== q.id) : [...s, q.id]))
+    setSelected((prev) => ({ ...prev, [q.id]: [] }))
+    setCustom((prev) => ({ ...prev, [q.id]: '' }))
+  }
+
+  /** Every question has a selection, a free-text answer, or an explicit skip. */
+  const complete = request.questions.every((q) => {
+    if (skipped.includes(q.id)) return true
+    if ((selected[q.id] ?? []).length > 0) return true
+    return (custom[q.id] ?? '').trim() !== ''
+  })
+
+  const submit = (): void => {
+    if (submitting || !complete) return
+    setSubmitting(true)
+    const answers = request.questions.map((q) => {
+      const text = (custom[q.id] ?? '').trim()
+      // A skip is the agreed blank shape: empty `selected`, no `custom`.
+      if (skipped.includes(q.id)) return { id: q.id, selected: [] }
+      const labels = selected[q.id] ?? []
+      // Single-select: free text replaces the choice. Multi-select: it adds to it.
+      if (text !== '' && q.multiSelect !== true) return { id: q.id, selected: [], custom: text }
+      return text === '' ? { id: q.id, selected: labels } : { id: q.id, selected: labels, custom: text }
+    })
+    // Retire the card FIRST. Answering through the live waterfall settles it
+    // synchronously, which republishes the carrier and tears this component
+    // down from inside its own handler; doing the bookkeeping afterwards ran
+    // against an unmounted card and left the panel wedged.
+    props.onSettled()
+    void Promise.resolve()
+      .then(() => request.answer({ answers }))
+      .catch((error: unknown) => {
+        props.onError(error instanceof Error ? error.message : String(error))
+      })
+  }
+
+  return (
+    <div className={css.sideQuestion} data-testid="sidechat-question" role="group" aria-label={props.t('sideQuestion.title')}>
+      <div className={css.sideQuestionHeader}>
+        <span className={css.sideQuestionDot} />
+        <span className={css.sideQuestionTitle}>{props.t('sideQuestion.title')}</span>
+      </div>
+      {request.questions.map((q) => {
+        const isSkipped = skipped.includes(q.id)
+        const chosen = selected[q.id] ?? []
+        return (
+          <div key={q.id} className={css.sideQuestionItem} data-skipped={isSkipped ? '1' : undefined}>
+            {q.header !== undefined && q.header !== '' && (
+              <div className={css.sideQuestionItemHeader}>{q.header}</div>
+            )}
+            <div className={css.sideQuestionText}>{q.question}</div>
+            {q.detail !== undefined && q.detail !== '' && (
+              <div className={css.sideQuestionDetail}>{q.detail}</div>
+            )}
+            {(q.options ?? []).length > 0 && (
+              <div className={css.sideQuestionOptions}>
+                {(q.options ?? []).map((o) => (
+                  <button
+                    key={o.label}
+                    type="button"
+                    className={css.sideQuestionOption}
+                    data-selected={chosen.includes(o.label) ? '1' : undefined}
+                    aria-pressed={chosen.includes(o.label)}
+                    disabled={submitting}
+                    onClick={() => { toggle(q, o.label) }}
+                  >
+                    <span className={css.sideQuestionOptionLabel}>{o.label}</span>
+                    {o.description !== undefined && o.description !== '' && (
+                      <span className={css.sideQuestionOptionDesc}>{o.description}</span>
+                    )}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className={css.sideQuestionRow}>
+              <input
+                type="text"
+                className={css.sideQuestionCustom}
+                placeholder={props.t('sideQuestion.customPlaceholder')}
+                value={custom[q.id] ?? ''}
+                disabled={submitting || isSkipped}
+                onChange={(e) => {
+                  const value = e.target.value
+                  setSkipped((s) => s.filter((id) => id !== q.id))
+                  setCustom((prev) => ({ ...prev, [q.id]: value }))
+                }}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && !e.nativeEvent.isComposing) { e.preventDefault(); submit() }
+                }}
+              />
+              <button
+                type="button"
+                className={css.sideQuestionSkip}
+                data-selected={isSkipped ? '1' : undefined}
+                disabled={submitting}
+                onClick={() => { skip(q) }}
+              >
+                {props.t('sideQuestion.skip')}
+              </button>
+            </div>
+          </div>
+        )
+      })}
+      <div className={css.sideQuestionActions}>
+        <button
+          type="button"
+          className={css.sideQuestionSubmit}
+          disabled={submitting || !complete}
+          onClick={submit}
+          data-testid="sidechat-question-submit"
+        >
+          {submitting ? props.t('sideQuestion.submitting') : props.t('sideQuestion.submit')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
 /** The side-chat panel body. */
 function SidechatPanel(props: {
   store: SidechatStore
@@ -1107,7 +1456,7 @@ function SidechatPanel(props: {
   /** A built-in sidebar overlay (fullscreen preview / floating panel) owns the viewport: hide this panel. */
   conflictHidden?: boolean
 }) {
-  const { panel, mainQuestion, dismissedQuestionIds } = useSyncExternalStore(props.store.subscribe, props.store.getSnapshot)
+  const { panel, mainQuestion, sideQuestion, dismissedQuestionIds } = useSyncExternalStore(props.store.subscribe, props.store.getSnapshot)
   /**
    * Whether this panel is on screen. The docked panel is mounted only while its
    * sidebar tab shows, and stays there after a page reload or app restart with
@@ -1437,6 +1786,24 @@ function SidechatPanel(props: {
     })
   }, [panel.activeChildId, panel.parentSessionId, props.store])
 
+  /** Rename one side chat (empty clears the name); optimistic, then re-listed. */
+  const renameItem = useCallback((childId: string, raw: string) => {
+    const name = raw.replace(/\s+/g, ' ').trim()
+    const items = props.store.getSnapshot().panel.items
+    props.store.patch({
+      items: items.map((i) => {
+        if (i.childId !== childId) return i
+        const { name: _old, ...rest } = i
+        return name === '' ? rest : { ...rest, name }
+      }),
+    })
+    const parentSessionId = panel.parentSessionId
+    void api.rename({ childId, name }).then((result) => {
+      if (!result.ok) props.store.patch({ error: result.error.message })
+      void refreshList(props.store, parentSessionId)
+    })
+  }, [panel.parentSessionId, props.store])
+
   /** Delete every side chat of this conversation at once. */
   const disposeAll = useCallback(() => {
     const ids = panel.items.map((i) => i.childId)
@@ -1734,25 +2101,15 @@ function SidechatPanel(props: {
                   </button>
                 </div>
                 {panel.items.map((item) => (
-                  <div key={item.childId} className={css.panelListItemRow}>
-                    <button
-                      type="button"
-                      className={`${css.panelListItem} ${item.childId === panel.activeChildId ? css.panelListItemActive : ''}`}
-                      onClick={() => { props.store.setActive(item.childId); void refreshHistory(props.store, item.childId) }}
-                    >
-                      <span className={css.panelListItemDot} data-running={item.running ? '1' : undefined} />
-                      <span className={css.panelListItemLabel}>{item.childId}</span>
-                    </button>
-                    <button
-                      type="button"
-                      className={css.panelListItemRemove}
-                      aria-label={props.t('panel.delete')}
-                      title={props.t('panel.delete')}
-                      onClick={() => { disposeItem(item.childId) }}
-                    >
-                      ×
-                    </button>
-                  </div>
+                  <SidechatListRow
+                    key={item.childId}
+                    item={item}
+                    active={item.childId === panel.activeChildId}
+                    t={props.t}
+                    onSelect={() => { props.store.setActive(item.childId); void refreshHistory(props.store, item.childId) }}
+                    onRename={(name) => { renameItem(item.childId, name) }}
+                    onDispose={() => { disposeItem(item.childId) }}
+                  />
                 ))}
               </>
             )}
@@ -1834,6 +2191,18 @@ function SidechatPanel(props: {
         )}
         {panel.error !== null && <div className={css.panelError}>{props.t('panel.error')}: {panel.error}</div>}
       </div>
+
+      {/* The side agent's own question: without this card the request reaches
+          no surface at all and its turn blocks until the user aborts it. */}
+      {sideQuestion !== null && sideQuestion.childId === panel.activeChildId && (
+        <SideQuestionCard
+          key={sideQuestion.key}
+          request={sideQuestion}
+          t={props.t}
+          onSettled={() => { props.store.settleSideQuestion(sideQuestion.key) }}
+          onError={(message) => { props.store.patch({ error: message }) }}
+        />
+      )}
 
       <div className={css.panelComposer}>
         {panel.attachment !== null && (
@@ -2491,6 +2860,80 @@ export function apply(ctx: Context): void {
     }, 1200)
     return () => { window.clearInterval(timer) }
   }, 'dsh-side-chat: clear stale question dialog')
+
+  // Track the ACTIVE SIDE CHAT's own pending `ask_user_question`.
+  //
+  // The host publishes a question card per Session, but renders it into the
+  // `conversation.composer` slot — which exists only for the main conversation
+  // view. A side chat has its own composer in this panel, so its agent's
+  // question reached no surface at all and the turn blocked until the user
+  // aborted it (`ASK_ABORTED`). Reading the child Session's pending
+  // interaction here gives the panel the same carrier the main card would
+  // have used, so the panel can render and answer it.
+  //
+  // The child Session is only listed while its turn runs (the plugin archives
+  // it when idle), which is exactly the window a pending question lives in.
+  ctx.effect(() => {
+    let lastKey: string | undefined
+    let offCarrier: (() => void) | undefined
+    // `read` is a store subscriber AND writes to the store. `setSideQuestion`
+    // only notifies on a real change, so the loop terminates on its own; this
+    // guard keeps the re-entrant pass from doing the work twice.
+    let reading = false
+    const read = (): void => {
+      if (reading) return
+      reading = true
+      try { readOnce() } finally { reading = false }
+    }
+    const readOnce = (): void => {
+      const childId = store.getSnapshot().panel.activeChildId
+      if (childId === null) {
+        if (lastKey !== undefined) { lastKey = undefined; offCarrier?.(); offCarrier = undefined }
+        store.setSideQuestion(null)
+        return
+      }
+      const interaction = pendingInteractionFor(childId)
+      // Only the answerable question family; an approval carries no question list.
+      const isQuestion = interaction !== undefined
+        && (interaction.kind === 'question' || interaction.kind === 'plan-review')
+        && Array.isArray(interaction.questions) && interaction.questions.length > 0
+        && typeof interaction.answer === 'function'
+      if (!isQuestion) {
+        if (lastKey !== undefined) { lastKey = undefined; offCarrier?.(); offCarrier = undefined }
+        store.setSideQuestion(null)
+        return
+      }
+      if (interaction.key === lastKey) return
+      lastKey = interaction.key
+      // Follow the carrier so a question that is CLOSED elsewhere (removed from
+      // the registry after being answered in another browser, or aborted)
+      // clears this panel too.
+      //
+      // Only `closed` ends the card. `channel` must NOT: submitting resolves
+      // the waterfall, which synchronously detaches it and reports
+      // `channel: 'none'` — reading that as a teardown unmounted the card from
+      // inside its own submit handler, dropped the answer, and then
+      // re-published the same question in a loop (the UI froze).
+      offCarrier?.()
+      offCarrier = interaction.subscribe?.(() => {
+        if (interaction.getSnapshot?.()?.closed !== true) return
+        lastKey = undefined
+        offCarrier?.()
+        offCarrier = undefined
+        store.setSideQuestion(null)
+      })
+      store.setSideQuestion({
+        childId,
+        key: interaction.key,
+        questions: [...interaction.questions!],
+        answer: (batch) => interaction.answer!(batch),
+      })
+    }
+    read()
+    const offPending = subscribePendingInteractions(read)
+    const offStore = store.subscribe(read)
+    return () => { offPending(); offStore(); offCarrier?.() }
+  }, 'dsh-side-chat: track side chat question')
 
   // Optional dock mode: live inside the new built-in right sidebar
   // (dsh-client-ui-sidebar-right) as a "Side chat" tab instead of the floating

@@ -491,6 +491,57 @@
   background: var(--dsw-alias-interactive-bg-hover);
 }
 
+/* A user-given name reads as text, not as an id. */
+.panelListItemLabel[data-named='1'] {
+  font-family: var(--dsw-font-family);
+}
+
+/* Copy name / Rename: shown on row hover or keyboard focus, like Delete's neighbours. */
+.panelListItemAction {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  color: var(--dsw-alias-label-tertiary);
+  background: transparent;
+  border: none;
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.1s;
+}
+
+.panelListItemAction svg {
+  width: 14px;
+  height: 14px;
+}
+
+.panelListItemRow:hover .panelListItemAction,
+.panelListItemRow:focus-within .panelListItemAction,
+.panelListItemAction[data-copied='1'] {
+  opacity: 1;
+}
+
+.panelListItemAction:hover {
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.panelListItemRename {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-state-business-primary);
+  border-radius: 8px;
+  padding: 4px 8px;
+  outline: none;
+}
+
 /* ---- Transcript ---- */
 .panelTranscript {
   flex: 1;
@@ -1183,4 +1234,213 @@
 
 .quoteActionsMenu .quoteAction:hover {
   background: var(--dsw-alias-interactive-bg-hover);
+}
+
+/* ---- Side chat's own ask_user_question card ----
+   The host renders its question card into the main conversation's composer
+   seat only, so a side chat's question had no surface at all. This card sits
+   directly above the side composer, where that answer belongs. */
+.sideQuestion {
+  flex: none;
+  max-height: 46%;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin: 0 14px 10px;
+  padding: 12px;
+  border: 1px solid var(--dsw-alias-state-business-primary);
+  border-radius: 14px;
+  background: var(--dsw-alias-bg-layer-1);
+  box-shadow: var(--dsw-shadow-lv2);
+}
+
+.sideQuestionHeader {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sideQuestionDot {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-business-primary);
+}
+
+.sideQuestionTitle {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 20px;
+}
+
+.sideQuestionItem {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--dsw-alias-border-l1);
+}
+
+.sideQuestionItem:first-of-type {
+  padding-top: 0;
+  border-top: none;
+}
+
+.sideQuestionItem[data-skipped='1'] {
+  opacity: 0.55;
+}
+
+.sideQuestionItemHeader {
+  color: var(--dsw-alias-label-caption);
+  font-size: 11px;
+  line-height: 16px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.sideQuestionText {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  line-height: 20px;
+  word-break: break-word;
+}
+
+.sideQuestionDetail {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-word;
+}
+
+.sideQuestionOptions {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.sideQuestionOption {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  width: 100%;
+  font-family: var(--dsw-font-family);
+  text-align: left;
+  border: 1px solid var(--dsw-alias-border-l1);
+  background: var(--dsw-alias-bg-layer-2);
+  border-radius: 10px;
+  padding: 6px 10px;
+  cursor: pointer;
+  transition: border-color 0.1s, background-color 0.1s;
+}
+
+.sideQuestionOption:hover:not(:disabled) {
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.sideQuestionOption[data-selected='1'] {
+  border-color: var(--dsw-alias-state-business-primary);
+  background: var(--dsw-alias-interactive-bg-hover);
+}
+
+.sideQuestionOption:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.sideQuestionOptionLabel {
+  color: var(--dsw-alias-label-primary);
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  word-break: break-word;
+}
+
+.sideQuestionOptionDesc {
+  color: var(--dsw-alias-label-secondary);
+  font-size: 12px;
+  line-height: 18px;
+  word-break: break-word;
+}
+
+.sideQuestionRow {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.sideQuestionCustom {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-primary);
+  background: var(--dsw-specific-input-major);
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  padding: 4px 10px;
+  outline: none;
+}
+
+.sideQuestionCustom:focus {
+  border-color: var(--dsw-alias-state-business-primary);
+}
+
+.sideQuestionCustom:disabled {
+  opacity: 0.6;
+}
+
+.sideQuestionSkip {
+  flex: none;
+  font-family: var(--dsw-font-family);
+  font-size: 12px;
+  line-height: 18px;
+  color: var(--dsw-alias-label-secondary);
+  background: transparent;
+  border: 1px solid var(--dsw-alias-border-l2);
+  border-radius: 999px;
+  padding: 3px 10px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.sideQuestionSkip[data-selected='1'] {
+  border-color: var(--dsw-alias-state-business-primary);
+  color: var(--dsw-alias-label-primary);
+}
+
+.sideQuestionSkip:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+.sideQuestionActions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.sideQuestionSubmit {
+  font-family: var(--dsw-font-family);
+  font-size: 13px;
+  line-height: 20px;
+  color: #fff;
+  background: var(--dsw-alias-button-info-fill);
+  border: none;
+  border-radius: 999px;
+  padding: 5px 16px;
+  cursor: pointer;
+  transition: background-color 0.1s;
+}
+
+.sideQuestionSubmit:hover:not(:disabled) {
+  background: var(--dsw-alias-button-info-hover);
+}
+
+.sideQuestionSubmit:disabled {
+  cursor: default;
+  opacity: 0.5;
 }

@@ -34,6 +34,10 @@ export const zh = {
   'panel.dispose': '结束此侧边聊天',
   'panel.delete': '删除',
   'panel.deleteAll': '删除全部',
+  'panel.rename': '重命名',
+  'panel.renamePlaceholder': '侧边聊天名称（留空恢复默认）',
+  'panel.copyName': '复制名称',
+  'panel.nameCopied': '已复制',
   'panel.error': '侧边聊天出错',
   'panel.running': '思考中…',
   'panel.copy': '复制',
@@ -108,6 +112,11 @@ export const zh = {
   'question.allPrompt': '请帮我理解上面的问题和各个选项的含义，并给出选择建议。',
   'question.onePrompt': '请帮我理解这个选项的含义，以及它在这个问题中的利弊。',
   'question.openHint': '主会话有一个问题弹框，点击在侧边聊天里询问',
+  'sideQuestion.title': '侧边聊天在等你回答',
+  'sideQuestion.customPlaceholder': '其他回答（可选）',
+  'sideQuestion.skip': '跳过',
+  'sideQuestion.submit': '提交回答',
+  'sideQuestion.submitting': '提交中…',
 }
 
 export const en = {
@@ -140,6 +149,10 @@ export const en = {
   'panel.dispose': 'End this side chat',
   'panel.delete': 'Delete',
   'panel.deleteAll': 'Delete all',
+  'panel.rename': 'Rename',
+  'panel.renamePlaceholder': 'Side chat name (empty = default)',
+  'panel.copyName': 'Copy name',
+  'panel.nameCopied': 'Copied',
   'panel.error': 'Side chat error',
   'panel.running': 'Thinking…',
   'panel.copy': 'Copy',
@@ -214,6 +227,11 @@ export const en = {
   'question.allPrompt': 'Please explain what this question is asking and what each option means, and advise how I should choose.',
   'question.onePrompt': 'Please explain what this option means and its trade-offs for this question.',
   'question.openHint': 'The main conversation has a question dialog — click to ask in the side chat',
+  'sideQuestion.title': 'The side chat is waiting for your answer',
+  'sideQuestion.customPlaceholder': 'Other answer (optional)',
+  'sideQuestion.skip': 'Skip',
+  'sideQuestion.submit': 'Submit answer',
+  'sideQuestion.submitting': 'Submitting…',
 }
 
 export type SidechatLocaleKey = keyof typeof zh

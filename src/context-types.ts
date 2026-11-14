@@ -109,7 +109,7 @@ export interface SideQuestionItem {
   multiSelect?: boolean
 }
 
-/** A pending main-conversation interaction (question / plan-review / approval dialog). */
+/** A pending conversation interaction (question / plan-review / approval dialog). */
 export interface SidePendingInteraction {
   /** Presentation discriminator: the question family, or an approval. */
   kind: 'question' | 'plan-review' | 'approval'
@@ -118,6 +118,33 @@ export interface SidePendingInteraction {
   sessionId: string
   /** The request's question list (present for the question family). */
   questions?: SideQuestionItem[]
+  /**
+   * Submit the whole answer batch through the carrier's live channel (the
+   * forwarded Host waterfall, or the Remote path once the call is continued).
+   * Present on the question family; the side panel answers its own chat's
+   * question with it, because the host question card only ever renders into
+   * the MAIN conversation's composer seat.
+   */
+  answer?: (batch: SideQuestionAnswer) => Promise<void>
+  /** Observe carrier state changes (countdown ticks, channel/state changes). */
+  subscribe?: (fn: () => void) => () => void
+  /** Read the carrier's current state (channel availability, closed flag). */
+  getSnapshot?: () => { channel?: 'waterfall' | 'rpc' | 'none'; closed?: boolean; state?: string }
+}
+
+/** One answered question of a batch. */
+export interface SideQuestionAnswerItem {
+  /** The answered question id. */
+  id: string
+  /** Selected option labels (empty with no `custom` means the user skipped it). */
+  selected: string[]
+  /** Optional free-text answer. */
+  custom?: string
+}
+
+/** One structured answer batch covering every question of a request. */
+export interface SideQuestionAnswer {
+  answers: SideQuestionAnswerItem[]
 }
 
 /** The per-session pending-interaction source exposed by the `uiSession` service. */
