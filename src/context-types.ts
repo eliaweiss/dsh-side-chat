@@ -226,6 +226,23 @@ export interface SideAgentModel {
   current?(): Readonly<SideModelSelection> | undefined
 }
 
+/** One pending-input list of the agent inbox. */
+export type SideInboxTarget = 'next-turn' | 'next-step'
+
+/**
+ * Durable pending input the driver claims at turn/step boundaries (DSH 0.2.2+).
+ * A turn that ends in an error stops the driver WITHOUT claiming it, so queued
+ * and steered messages stay here until something wakes the agent again.
+ */
+export interface SideAgentInbox {
+  /** Prompts awaiting individual turns. */
+  readonly nextTurn: readonly unknown[]
+  /** Input awaiting the next step boundary. */
+  readonly nextStep: readonly unknown[]
+  /** Standard splice over one list; returns the removed messages. */
+  splice(target: SideInboxTarget, start: number, deleteCount: number, inserted: unknown[]): unknown[]
+}
+
 /** The live agent face (`ctx.agents.get(id)` / `AgentHandle.agent`). */
 export interface SideAgent {
   readonly id: string
@@ -235,6 +252,8 @@ export interface SideAgent {
   readonly ctx: Context
   /** Durable model choice; present from DSH 0.2.2-alpha.3, absent on the 0.2.1 line. */
   readonly model?: SideAgentModel
+  /** Pending input; absent on hosts that do not expose it. */
+  readonly inbox?: SideAgentInbox
   followup(message: unknown): void
   /** Next-step input into the running turn; optional so older hosts still type-check. */
   steer?(message: unknown): void

@@ -111,6 +111,68 @@ const recordSelection = (agent: SideAgent, selection: SideModelSelection | undef
   }
 }
 
+/** Head message id each agent was last woken with by {@link resumeParked}. */
+const resumedHead = new WeakMap<SideAgent, unknown>()
+
+/**
+ * Run input a side chat's driver left parked. A turn that ends in an error
+ * (a request timeout, a provider failure) stops the driver without claiming
+ * the inbox, so messages queued or steered during that turn wait there until
+ * the next send wakes the agent. The main chat shows that parked queue; the
+ * side chat showed nothing, and its queued messages silently never ran.
+ *
+ * The parked messages are taken out and handed back in order (steering
+ * first, as the driver would claim it), which opens the next turn. If the
+ * same head message is parked again right after being resubmitted, the
+ * driver refused it (a blocked pre-step), so it is left alone instead of
+ * looping.
+ * @returns whether the agent was woken.
+ */
+function resumeParked(agent: SideAgent): boolean {
+  const inbox = agent.inbox
+  if (inbox === undefined || agent.status !== 'idle') return false
+  const steps = [...inbox.nextStep]
+  const turns = [...inbox.nextTurn]
+  const head = steps[0] ?? turns[0]
+  if (head === undefined) {
+    resumedHead.delete(agent)
+    return false
+  }
+  const headId = (head as { id?: unknown }).id
+  if (headId !== undefined && resumedHead.get(agent) === headId) return false
+  resumedHead.set(agent, headId)
+  try {
+    inbox.splice('next-step', 0, steps.length, [])
+    inbox.splice('next-turn', 0, turns.length, [])
+    for (const message of steps) {
+      if (typeof agent.steer === 'function') agent.steer(message)
+      else agent.followup(message)
+    }
+    for (const message of turns) agent.followup(message)
+    return true
+  } catch (error) {
+    console.warn('[dsh-side-chat] resubmitting parked input failed:', error instanceof Error ? error.message : String(error))
+    return false
+  }
+}
+
+/**
+ * Call `done` once a side chat has really settled: idle, with no parked
+ * input left to run. Parked input is resubmitted first, and an agent that
+ * another delivery already woke again is waited on, so the session is never
+ * re-archived (which cancels a running turn and drops its queue) mid-work.
+ */
+function whenSettled(agent: SideAgent, done: () => void): void {
+  const after = (): void => {
+    if (resumeParked(agent) || agent.status === 'running') {
+      void agent.whenIdle().then(after, after)
+      return
+    }
+    done()
+  }
+  void agent.whenIdle().then(after, after)
+}
+
 /** One live side chat the host owns. */
 interface SidechatRecord {
   childId: string
@@ -659,7 +721,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       settleTurn(record)
       throw error
     }
-    void record.handle.agent.whenIdle().then(() => { settleTurn(record) }, () => { settleTurn(record) })
+    whenSettled(record.handle.agent, () => { settleTurn(record) })
   }
 
   /**
@@ -884,7 +946,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       await unarchiveChild(childId)
       if (mode === 'steer' && typeof child.steer === 'function') child.steer(message)
       else child.followup(message)
-      void child.whenIdle().then(() => { void archiveChild(childId) }, () => { void archiveChild(childId) })
+      whenSettled(child, () => { void archiveChild(childId) })
       return { accepted: true }
     }
     await deliver(record, message, mode)
