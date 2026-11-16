@@ -788,6 +788,55 @@
   line-height: 18px;
 }
 
+/* ---- Turn-end notice (mirrors the main chat's turn-error row) ---- */
+.turnNotice {
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  padding: 2px 0;
+  font-size: 13px;
+  line-height: 20px;
+}
+
+.turnNoticeDot,
+.turnNoticeDotWarn {
+  width: 6px;
+  height: 6px;
+  margin: 7px 0 0 2px;
+  border-radius: 50%;
+  background: var(--dsw-alias-state-error-primary);
+}
+
+.turnNoticeDotWarn {
+  background: var(--dsw-alias-state-warn-primary);
+}
+
+.turnNoticeCopy {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.turnNoticeTitle,
+.turnNoticeTitleWarn {
+  margin-right: 6px;
+  color: var(--dsw-alias-state-error-primary);
+  font-weight: 600;
+}
+
+.turnNoticeTitleWarn {
+  color: var(--dsw-alias-state-warn-primary);
+}
+
+.turnNoticeMessage {
+  color: var(--dsw-alias-label-secondary);
+}
+
+.turnNoticeCode {
+  color: var(--dsw-alias-label-tertiary);
+  font: var(--dsw-font-markdown-code-block-small);
+}
+
 /* ---- Composer ---- */
 .panelComposer {
   flex: none;

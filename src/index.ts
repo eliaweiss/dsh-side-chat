@@ -342,8 +342,42 @@ type PromptContentPart = { type: 'text'; text: string } | { type: 'image'; media
 /** Model-facing content block (text or durable image reference). */
 type ContentBlock = { type: 'text'; text: string } | { type: 'image'; attachment: SideImageAttachmentRef }
 
-/** One transcript block (text or durable image reference). */
-type TranscriptBlock = { type: 'text'; text: string } | { type: 'image'; ref: SideImageAttachmentRef } | { type: 'reasoning'; text: string }
+/**
+ * How a turn ended, when the main chat shows a row for it: `error` (a request
+ * timeout, a provider failure), `stopped` (DSH exited mid-turn, or a sign-out
+ * cancel), or `max-tokens` (the reply hit the output cap).
+ */
+type TurnNoticeBlock = { type: 'turn-notice'; notice: 'error' | 'stopped' | 'max-tokens'; message: string; code?: string }
+
+/** One transcript block (text, durable image reference, reasoning, or turn-end notice). */
+type TranscriptBlock = { type: 'text'; text: string } | { type: 'image'; ref: SideImageAttachmentRef } | { type: 'reasoning'; text: string } | TurnNoticeBlock
+
+/**
+ * The notice the main chat shows for one `turn/end` reason (mirrors DSH's
+ * turn-error and turn-max-tokens chat nodes). User and parent cancels, normal
+ * completions and blocked turns show nothing.
+ */
+function turnNotice(reason: unknown): TurnNoticeBlock | undefined {
+  if (reason === null || typeof reason !== 'object') return undefined
+  const r = reason as { kind?: unknown; error?: unknown; reason?: unknown }
+  if (r.kind === 'max-tokens') return { type: 'turn-notice', notice: 'max-tokens', message: '' }
+  if (r.kind === 'interrupted') return { type: 'turn-notice', notice: 'stopped', message: 'The DSH process exited before this turn finished.', code: 'INTERRUPTED' }
+  if (r.kind === 'aborted') {
+    const cause = r.reason as { kind?: unknown; reason?: unknown } | null | undefined
+    return cause?.kind === 'hook' && cause.reason === 'deepseek-account/signed-out'
+      ? { type: 'turn-notice', notice: 'stopped', message: 'Stopped because you signed out of DeepSeek.', code: 'ACCOUNT_SIGNED_OUT' }
+      : undefined
+  }
+  if (r.kind !== 'error') return undefined
+  const failure = r.error
+  if (failure === null || typeof failure !== 'object') return { type: 'turn-notice', notice: 'error', message: String(failure) }
+  const f = failure as { code?: unknown; message?: unknown }
+  const code = typeof f.code === 'string' ? f.code : undefined
+  // A provider AUTH message may echo part of the credential; the client shows
+  // its own copy for that code, so the raw text never leaves the session log.
+  const message = code === 'AUTH' ? '' : typeof f.message === 'string' ? f.message : JSON.stringify(failure)
+  return { type: 'turn-notice', notice: 'error', message, ...(code === undefined ? {} : { code }) }
+}
 
 /** The lookup guidance appended as an extra text block (hidden from the UI). */
 const GUIDANCE_MARKER = '[sidechat-guidance]'
@@ -399,6 +433,10 @@ function foldTranscript(events: readonly { type: string; data: Record<string, un
       const message = event.data.message as Record<string, unknown> | null
       const blocks = fold(message?.content)
       if (blocks.length > 0) messages.push({ role: 'assistant', blocks })
+    } else if (event.type === 'turn/end') {
+      // Without this the side chat ended a failed turn quietly.
+      const notice = turnNotice(event.data.reason)
+      if (notice !== undefined) messages.push({ role: 'assistant', blocks: [notice] })
     }
   }
   return messages

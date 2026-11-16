@@ -36,7 +36,20 @@ export interface SidechatImageRef {
 }
 
 /** One transcript message block. */
-export type SidechatMessageBlock = { type: 'text'; text: string } | { type: 'image'; ref: SidechatImageRef } | { type: 'reasoning'; text: string }
+export type SidechatMessageBlock =
+  | { type: 'text'; text: string }
+  | { type: 'image'; ref: SidechatImageRef }
+  | { type: 'reasoning'; text: string }
+  | SidechatTurnNotice
+
+/** How a turn ended, when it warrants a row (a failed, stopped, or capped turn). */
+export interface SidechatTurnNotice {
+  type: 'turn-notice'
+  notice: 'error' | 'stopped' | 'max-tokens'
+  /** Provider message; empty when the client owns the copy for `code`. */
+  message: string
+  code?: string
+}
 
 /** One transcript message. */
 export interface SidechatMessage {

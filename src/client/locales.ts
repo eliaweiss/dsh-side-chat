@@ -130,6 +130,14 @@ export const zh = {
   'sideQuestion.skip': '跳过',
   'sideQuestion.submit': '提交回答',
   'sideQuestion.submitting': '提交中…',
+  'turn.failed': '本轮运行失败',
+  'turn.stopped': '任务已停止',
+  'turn.maxTokens': '已达到输出 token 上限',
+  'turn.failure.auth': 'API 密钥无效',
+  'turn.failure.quota': '当前请求的额度已用尽',
+  'turn.failure.signInRequired': '请先登录 DeepSeek，并确认请求地址支持账号认证。',
+  'turn.failure.signedOut': '任务已因退出 DeepSeek 登录而停止。',
+  'turn.failure.interrupted': 'DSH 进程在本轮完成前退出（例如被强制结束、崩溃或关闭超时），重新启动后本轮已中止。未完成的工具调用结果未知。',
 }
 
 export const en = {
@@ -258,6 +266,14 @@ export const en = {
   'sideQuestion.skip': 'Skip',
   'sideQuestion.submit': 'Submit answer',
   'sideQuestion.submitting': 'Submitting…',
+  'turn.failed': 'This turn failed',
+  'turn.stopped': 'Task stopped',
+  'turn.maxTokens': 'Output token limit reached',
+  'turn.failure.auth': 'API key is invalid',
+  'turn.failure.quota': 'Request quota exhausted.',
+  'turn.failure.signInRequired': 'Sign in to DeepSeek and ensure the request destination supports account authentication.',
+  'turn.failure.signedOut': 'Stopped because you signed out of DeepSeek.',
+  'turn.failure.interrupted': 'The DSH process exited before this turn finished (for example, it was killed, crashed, or timed out while shutting down), so the turn was closed when DSH restarted. Unfinished tool calls have unknown results.',
 }
 
 export type SidechatLocaleKey = keyof typeof zh

@@ -180,7 +180,42 @@ test('history reads migrated V3/V4 events and excludes producer-owned injected c
   const result = await call('sidechat.history', { childId: 'compat' })
   expect(result.status).toBe(200)
   expect(ctx.sessionQuery.readSession).toHaveBeenCalledWith('compat')
-  expect(result.body.value.messages).toEqual([{ role: 'user', blocks: [{ type: 'text', text: 'continue' }] }])
+  expect(result.body.value.messages).toEqual([
+    // The migration closes the turn the V3 restart left open as `interrupted`,
+    // which the main chat shows as "Task stopped" too.
+    { role: 'assistant', blocks: [{ type: 'turn-notice', notice: 'stopped', message: 'The DSH process exited before this turn finished.', code: 'INTERRUPTED' }] },
+    { role: 'user', blocks: [{ type: 'text', text: 'continue' }] },
+  ])
+})
+
+test('history shows how a failed, stopped, or capped turn ended, like the main chat', async () => {
+  const { call, ctx } = mount()
+  const end = (turn: number, reason: unknown) => ({ type: 'turn/end', seq: turn * 10, time: turn, data: { turn, reason } })
+  const user = (text: string) => ({ type: 'user/message', seq: 0, time: 0, data: { content: [{ type: 'text', text }], source: { kind: 'user' } } })
+  ctx.sessionQuery.readSession.mockResolvedValueOnce({
+    events: [
+      user('one'),
+      end(1, { kind: 'completed' }),
+      user('two'),
+      end(2, { kind: 'error', error: { message: 'Request timed out.', code: 'TIMEOUT' } }),
+      end(3, { kind: 'aborted', reason: { kind: 'user' } }),
+      end(4, { kind: 'error', error: { message: 'bad key sk-12…', code: 'AUTH' } }),
+      end(5, { kind: 'max-tokens' }),
+      end(6, { kind: 'interrupted' }),
+      end(7, { kind: 'blocked' }),
+    ],
+  })
+  const result = await call('sidechat.history', { childId: 'failed' })
+  expect(result.status).toBe(200)
+  expect(result.body.value.messages).toEqual([
+    { role: 'user', blocks: [{ type: 'text', text: 'one' }] },
+    { role: 'user', blocks: [{ type: 'text', text: 'two' }] },
+    { role: 'assistant', blocks: [{ type: 'turn-notice', notice: 'error', message: 'Request timed out.', code: 'TIMEOUT' }] },
+    // The AUTH message can echo the key; only the code reaches the client.
+    { role: 'assistant', blocks: [{ type: 'turn-notice', notice: 'error', message: '', code: 'AUTH' }] },
+    { role: 'assistant', blocks: [{ type: 'turn-notice', notice: 'max-tokens', message: '' }] },
+    { role: 'assistant', blocks: [{ type: 'turn-notice', notice: 'stopped', message: 'The DSH process exited before this turn finished.', code: 'INTERRUPTED' }] },
+  ])
 })
 
 test('a remote authority reaches the routes only when the runtime declares it', async () => {

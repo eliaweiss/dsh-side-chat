@@ -40,6 +40,7 @@ import {
   type PromptContentPart,
   type SidechatDirectory,
   type SidechatImageRef,
+  type SidechatTurnNotice,
   type SidechatListItem,
   type SidechatMessage,
   type SidechatPastItem,
@@ -685,6 +686,31 @@ function ReasoningRow(props: { text: string; t: (key: SidechatLocaleKey) => stri
     >
       <div className={css.reasoningBody}>{props.text}</div>
     </DisclosureRow>
+  )
+}
+
+/**
+ * Main-conversation-style row for how a turn ended (failed, stopped, or cut at
+ * the output cap). Copy mirrors the main chat's turn-error row.
+ */
+function TurnNoticeRow(props: { notice: SidechatTurnNotice; t: (key: SidechatLocaleKey) => string }) {
+  const { notice, code } = props.notice
+  const title = notice === 'max-tokens' ? props.t('turn.maxTokens') : notice === 'stopped' ? props.t('turn.stopped') : props.t('turn.failed')
+  const message = code === 'ACCOUNT_SIGNED_OUT' ? props.t('turn.failure.signedOut')
+    : code === 'INTERRUPTED' ? props.t('turn.failure.interrupted')
+      : code === 'ACCOUNT_SIGN_IN_REQUIRED' ? props.t('turn.failure.signInRequired')
+        : code === 'QUOTA' || code === 'ACCOUNT_QUOTA' ? props.t('turn.failure.quota')
+          : code === 'AUTH' ? props.t('turn.failure.auth')
+            : props.notice.message
+  return (
+    <div className={css.turnNotice} data-sidechat-turn-notice={notice} data-testid="sidechat-turn-notice" role="status">
+      <span className={notice === 'max-tokens' ? css.turnNoticeDotWarn : css.turnNoticeDot} />
+      <div className={css.turnNoticeCopy}>
+        <span className={notice === 'max-tokens' ? css.turnNoticeTitleWarn : css.turnNoticeTitle}>{title}</span>
+        {message !== '' && <span className={css.turnNoticeMessage}>{message}</span>}
+      </div>
+      {code !== undefined && code !== 'INTERRUPTED' && <code className={css.turnNoticeCode}>{code}</code>}
+    </div>
   )
 }
 
@@ -2248,6 +2274,7 @@ function SidechatPanel(props: {
           const textBlocks = message.blocks.filter((b) => b.type === 'text')
           const imageBlocks = message.blocks.filter((b) => b.type === 'image')
           const reasoningBlocks = message.blocks.filter((b) => b.type === 'reasoning')
+          const notices = message.blocks.filter((b): b is SidechatTurnNotice => b.type === 'turn-notice')
           const text = textBlocks.map((b) => (b.type === 'text' ? b.text : '')).join('\n')
           const images = imageBlocks.map((b) => (b.type === 'image' ? { attachment: b.ref } : null)).filter((x): x is { attachment: SidechatImageRef } => x !== null)
           if (message.role === 'user') {
@@ -2296,6 +2323,9 @@ function SidechatPanel(props: {
                   </button>
                 </div>
               )}
+              {notices.map((notice, nIndex) => (
+                <TurnNoticeRow key={`notice-${nIndex}`} notice={notice} t={props.t} />
+              ))}
             </div>
           )
         })}
