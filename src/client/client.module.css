@@ -474,7 +474,6 @@
   color: var(--dsw-alias-label-tertiary);
 }
 
-.pastStatus[data-status='orphan'],
 .pastStatus[data-status='earlier'] {
   color: var(--dsw-alias-label-secondary);
 }

@@ -117,7 +117,7 @@ export const api = {
   /** Rename one side chat; an empty name clears it. */
   rename: (args: { childId: string; name: string }) =>
     call<{ name?: string }>('sidechat.rename', args),
-  /** Every side chat ever started for a conversation (incl. closed / earlier versions / orphans). */
+  /** Every side chat ever started for a conversation (incl. closed ones and ones from earlier versions of it). */
   past: (args: { parentSessionId: string }) =>
     call<{ items: SidechatPastItem[] }>('sidechat.past', args),
   /** Put one past side chat back into a conversation's list. */
@@ -131,5 +131,5 @@ export interface SidechatPastItem {
   name?: string
   createdAt: number
   preview: string
-  status: 'listed' | 'closed' | 'earlier' | 'orphan'
+  status: 'listed' | 'closed' | 'earlier'
 }

@@ -229,22 +229,17 @@ async function writeLineage(steps: LineageStep[]): Promise<void> {
 /** Side-chat session ids are minted as `subchat-<uuid>`; refuse anything else. */
 const SIDECHAT_ID = /^subchat-[0-9a-zA-Z]+(?:-[0-9a-zA-Z]+)*$/
 
-/**
- * Scan the session store on disk: every side-chat session id and every
- * session id present (a conversation whose directory is gone was deleted).
- */
-async function scanSessionStore(): Promise<{ sidechatIds: string[]; existing: Set<string> }> {
+/** Scan the session store on disk for every side-chat session id. */
+async function scanSidechatIds(): Promise<string[]> {
   const root = dshHomePath('sessions')
   const sidechatIds: string[] = []
-  const existing = new Set<string>()
   let entries
   try {
     entries = await readdir(root, { withFileTypes: true })
   } catch {
-    return { sidechatIds, existing }
+    return sidechatIds
   }
   const visit = (name: string): void => {
-    existing.add(name)
     if (SIDECHAT_ID.test(name)) sidechatIds.push(name)
   }
   for (const entry of entries) {
@@ -261,7 +256,7 @@ async function scanSessionStore(): Promise<{ sidechatIds: string[]; existing: Se
     }
     for (const child of inner) if (child.isDirectory()) visit(child.name)
   }
-  return { sidechatIds, existing }
+  return sidechatIds
 }
 
 /** One row of the "all past side chats" view. */
@@ -274,10 +269,9 @@ interface PastItem {
   /**
    * `listed`: already in this conversation's list. `closed`: removed from the
    * list earlier (its log is kept). `earlier`: started under an earlier version
-   * of this conversation (before an edit/rewind). `orphan`: its conversation
-   * was deleted and no successor is known.
+   * of this conversation (before an edit/rewind).
    */
-  status: 'listed' | 'closed' | 'earlier' | 'orphan'
+  status: 'listed' | 'closed' | 'earlier'
 }
 
 /** Browser-submitted prompt content part (text or base64 image). */
@@ -1155,10 +1149,10 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   }
 
   /**
-   * Every side chat ever started for one conversation, including the ones
-   * closed from the list, the ones started under earlier versions of it
-   * (before an edit/rewind), and orphans whose conversation was deleted with no
-   * known successor (from the same folder) so they can be brought back.
+   * Every side chat ever started for one conversation: the listed ones, the
+   * ones closed from the list, and the ones started under earlier versions of
+   * it (before an edit/rewind). Side chats of any other conversation — even
+   * one that was deleted — are never included.
    */
   const past = async (payload: unknown): Promise<{ items: PastItem[] }> => {
     const parentSessionId = requireString(payload, 'parentSessionId')
@@ -1175,9 +1169,7 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         }
       }
     }
-    const succeeded = new Set(lineage.map((step) => step.from))
-    const parentCwd = ctx.agents.get(parentSessionId)?.session.header.cwd
-    const { sidechatIds, existing } = await scanSessionStore()
+    const sidechatIds = await scanSidechatIds()
     const recordOf = (childId: string): { parentSessionId: string; name?: string; createdAt: number } | undefined =>
       sideChats.get(childId) ?? dormant.get(childId)
     const items: PastItem[] = []
@@ -1193,13 +1185,10 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         preview: header.preview,
       }
       if (record !== undefined) {
-        if (record.parentSessionId === parentSessionId) {
-          items.push({ ...base, status: 'listed' })
-          continue
-        }
-        // Listed under a deleted conversation that has no known successor.
-        const gone = !existing.has(record.parentSessionId) && !succeeded.has(record.parentSessionId)
-        if (gone && (parentCwd === undefined || header.cwd === parentCwd)) items.push({ ...base, status: 'orphan' })
+        // Still listed somewhere: only this conversation's (or an earlier
+        // version's) count; one listed under another conversation stays there.
+        if (record.parentSessionId === parentSessionId) items.push({ ...base, status: 'listed' })
+        else if (versions.has(record.parentSessionId)) items.push({ ...base, status: 'earlier' })
         continue
       }
       const owner = header.parentSessionId
@@ -1208,15 +1197,13 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         items.push({ ...base, status: 'closed' })
       } else if (versions.has(owner)) {
         items.push({ ...base, status: 'earlier' })
-      } else if (!existing.has(owner) && !succeeded.has(owner) && (parentCwd === undefined || header.cwd === parentCwd)) {
-        items.push({ ...base, status: 'orphan' })
       }
     }
     items.sort((a, b) => b.createdAt - a.createdAt)
     return { items }
   }
 
-  /** Put one past side chat (closed, earlier, or orphaned) back into a conversation's list. */
+  /** Put one past side chat (closed or from an earlier version) back into a conversation's list. */
   const reopen = async (payload: unknown): Promise<{ accepted: true }> => {
     const childId = requireString(payload, 'childId')
     const parentSessionId = requireString(payload, 'parentSessionId')

@@ -581,10 +581,10 @@ function SidechatListRow(props: {
 
 /**
  * Every side chat ever started for this conversation: the listed ones, the
- * ones closed from the list (their log is kept), the ones started under an
- * earlier version of the conversation (before a message edit/rewind), and
- * orphans whose conversation was deleted. Picking one brings it back into the
- * list and opens it.
+ * ones closed from the list (their log is kept), and the ones started under
+ * an earlier version of the conversation (before a message edit/rewind).
+ * Side chats of other conversations are never shown. Picking one brings it
+ * back into the list and opens it.
  */
 function PastSideChats(props: {
   parentSessionId: string

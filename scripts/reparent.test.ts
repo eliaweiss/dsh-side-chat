@@ -4,7 +4,8 @@
  * after the edit the panel was empty and every side chat looked lost. The
  * rewind plugin now emits `message-rewind/rewound`, and the side chats follow
  * the conversation. "All past side chats" also finds the ones closed from the
- * list, the ones from an earlier version of the conversation, and orphans.
+ * list and the ones from an earlier version of the conversation — and only
+ * those: side chats of any other conversation never show up.
  */
 import { mkdir, rm } from 'node:fs/promises'
 import { Readable } from 'node:stream'
@@ -145,28 +146,54 @@ test('a rewound conversation keeps its side chats, and they resume on the succes
   expect(ids((await again.call('sidechat.list', { parentSessionId: 'parent-2' })).body.value.items)).toEqual([a, b])
 })
 
-test('all past side chats: listed, closed, from before an edit, and orphans can be reopened', async () => {
+test('all past side chats: listed, closed, and from before an edit can be reopened', async () => {
   const m = mount()
   const listed = await start(m, 'parent-1', 'kept')
   const closedEarlier = await start(m, 'parent-1', 'closed before the edit')
-  const orphan = await start(m, 'parent-3', 'lost conversation')
+  const closedNow = await start(m, 'parent-1', 'closed after the edit')
   await m.call('sidechat.dispose', { childId: closedEarlier })
   m.emit(REWOUND_EVENT, { sourceSessionId: 'parent-1', sessionId: 'parent-2', action: 'edit' })
   await flush()
-  // parent-1 was purged by the rewind; parent-3 was deleted with no successor.
-  await writeStore(['session-dummy', 'parent-2'])
+  await m.call('sidechat.dispose', { childId: closedNow })
+  // parent-1 was purged by the rewind.
+  await writeStore(['session-dummy', 'parent-2', 'parent-3'])
 
   const past = (await m.call('sidechat.past', { parentSessionId: 'parent-2' })).body.value.items
   const byId = new Map(past.map((i: any) => [i.childId, i]))
+  expect(byId.size).toBe(3)
   expect((byId.get(listed) as any)?.status).toBe('listed')
   expect((byId.get(closedEarlier) as any)?.status).toBe('earlier')
-  expect((byId.get(orphan) as any)?.status).toBe('orphan')
+  // Its header still names the pre-edit session, so it reads as "before an edit".
+  expect((byId.get(closedNow) as any)?.status).toBe('earlier')
   expect((byId.get(closedEarlier) as any)?.preview).toBe(`prompt of ${closedEarlier}`)
 
-  for (const childId of [closedEarlier, orphan]) {
+  for (const childId of [closedEarlier, closedNow]) {
     expect((await m.call('sidechat.reopen', { childId, parentSessionId: 'parent-2' })).status).toBe(200)
   }
   expect(new Set(ids((await m.call('sidechat.list', { parentSessionId: 'parent-2' })).body.value.items)))
-    .toEqual(new Set([listed, closedEarlier, orphan]))
+    .toEqual(new Set([listed, closedEarlier, closedNow]))
   expect((await m.call('sidechat.reopen', { childId: '../etc', parentSessionId: 'parent-2' })).status).toBe(400)
+  await flush() // let the background saves finish before the next test wipes the folder
+})
+
+test('all past side chats never lists side chats of another conversation', async () => {
+  const m = mount()
+  const mine = await start(m, 'parent-1', 'mine')
+  const otherOpen = await start(m, 'parent-2', 'other, still listed')
+  const otherClosed = await start(m, 'parent-2', 'other, closed')
+  const fromDeleted = await start(m, 'parent-3', 'its conversation was deleted')
+  const fromDeletedClosed = await start(m, 'parent-3', 'closed, conversation deleted')
+  await m.call('sidechat.dispose', { childId: otherClosed })
+  await m.call('sidechat.dispose', { childId: fromDeletedClosed })
+  await flush()
+  // parent-3 is gone from disk with no successor: its side chats used to be offered everywhere.
+  await writeStore(['parent-1', 'parent-2'])
+
+  expect(ids((await m.call('sidechat.past', { parentSessionId: 'parent-1' })).body.value.items)).toEqual([mine])
+  expect(new Set(ids((await m.call('sidechat.past', { parentSessionId: 'parent-2' })).body.value.items)))
+    .toEqual(new Set([otherOpen, otherClosed]))
+  expect(ids((await m.call('sidechat.past', { parentSessionId: 'session-unknown' })).body.value.items)).toEqual([])
+  // They still belong to their own conversation.
+  expect(new Set(ids((await m.call('sidechat.past', { parentSessionId: 'parent-3' })).body.value.items)))
+    .toEqual(new Set([fromDeleted, fromDeletedClosed]))
 })
