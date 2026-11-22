@@ -349,6 +349,12 @@ export interface SideSessionLogSnapshot {
 
 /** The session query face. */
 export interface SideSessionQuery {
+  listSessions(): Promise<Array<{ header: SideSessionHeader & { id: string } }>>
+  /** Point read without listing the corpus; newer hosts expose immutable observation leases. */
+  observeSession?(id: string, options: { projectionMode: 'none' }): Promise<{
+    readonly events: readonly SideSessionEvent[]
+    [Symbol.dispose](): void
+  }>
   readSession(sessionId: string): Promise<SideSessionLogSnapshot>
 }
 

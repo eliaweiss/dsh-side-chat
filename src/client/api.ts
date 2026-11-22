@@ -18,6 +18,8 @@ export interface SidechatListItem {
   childId: string
   /** User-given display name (absent = shown by its id). */
   name?: string
+  /** First prompt, when already indexed by the host. */
+  preview?: string
   running: boolean
   runningSince?: number
 }

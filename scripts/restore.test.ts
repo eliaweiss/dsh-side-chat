@@ -62,7 +62,9 @@ function mount() {
 
   const ctx: any = {
     fiber: { entry: { options: { id: 'side-chat-entry' } } },
-    get: () => undefined,
+    get: (service: string) => service === 'sessionPersistence' ? {
+      stat: async (id: string) => { log.push(`stat:${id}`); return disk.has(id) ? {} : undefined },
+    } : undefined,
     inject: () => {},
     effect: (callback: () => unknown, label?: string) => {
       if (label?.includes('re-archive')) return undefined
@@ -90,6 +92,7 @@ function mount() {
     },
     sessionQuery: {
       readSession: async (id: string) => {
+        log.push(`read:${id}`)
         if (!disk.has(id)) throw new Error('not found')
         return { events: [] }
       },
@@ -138,8 +141,8 @@ test('side chats from an earlier run stay listed and resume on their next messag
   const second = mount()
   const listed = await second.call('sidechat.list', { parentSessionId: 'parent-1' })
   expect(listed.body.value.items).toEqual([
-    { childId: a, running: false },
-    { childId: b, running: false },
+    { childId: a, preview: 'one', running: false },
+    { childId: b, preview: 'two', running: false },
   ])
 
   // A new side chat in the new run must not wipe the earlier ones from the record.
@@ -167,7 +170,7 @@ test('ending a side chat from an earlier run forgets it; a deleted session is dr
   disk.delete(b)
 
   const second = mount()
-  expect((await second.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([{ childId: a, running: false }])
+  expect((await second.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([{ childId: a, preview: 'one', running: false }])
   // Stopping an idle dormant chat is a no-op, not an error.
   expect((await second.call('sidechat.stop', { childId: a })).status).toBe(200)
   expect((await second.call('sidechat.dispose', { childId: a })).status).toBe(200)
@@ -189,14 +192,20 @@ test('a side chat started from highlighted text is named after it, across a rest
   expect((await first.call('sidechat.start', { parentSessionId: 'parent-1', content: [{ type: 'text', text: 'x' }], name: 42 })).status).toBe(400)
   expect((await first.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([
     { childId: quoted, name: 'The office dog is named Max.', running: false },
-    { childId: plain, running: false },
+    { childId: plain, preview: 'no quote', running: false },
   ])
   await flush()
   first.unload()
 
   const second = mount()
-  expect((await second.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items).toEqual([
+  const list = async () => (await second.call('sidechat.list', { parentSessionId: 'parent-1' })).body.value.items
+  expect(await list()).toEqual([
     { childId: quoted, name: 'The office dog is named Max.', running: false },
-    { childId: plain, running: false },
+    { childId: plain, preview: 'no quote', running: false },
   ])
+  await second.call('sidechat.rename', { childId: plain, name: 'Custom title' })
+  expect((await list())[1]).toEqual({ childId: plain, name: 'Custom title', running: false })
+  await second.call('sidechat.rename', { childId: plain, name: '' })
+  expect((await list())[1]).toEqual({ childId: plain, preview: 'no quote', running: false })
+  await flush()
 })

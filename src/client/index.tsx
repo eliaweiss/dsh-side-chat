@@ -31,6 +31,8 @@ import {
   type ImageLoader,
 } from './attachments/index.ts'
 import { SidechatErrorBoundary } from './ErrorBoundary.tsx'
+import { chatTitle } from './chat-title.ts'
+import { createListReader, provisionalPastRows } from './list-reader.ts'
 import { escapeCurrency } from './currency.ts'
 import { useCopyText } from './clipboard.ts'
 import { FOLLOW_THRESHOLD_PX, STALE_ECHO_MS, unresolvedEchoes, userMessageCount, type PendingEcho } from './pending.ts'
@@ -67,6 +69,9 @@ interface PanelState {
   parentSessionId: string
   activeChildId: string | null
   items: SidechatListItem[]
+  listKnown: boolean
+  listError: string | null
+  pastItems: SidechatPastItem[] | null
   messages: SidechatMessage[]
   draft: string
   /** Staged selection shown as an attachment while "send immediately" is off. */
@@ -148,6 +153,7 @@ interface SidechatStore {
   dismissQuestion(id: string): void
   dismissAllQuestions(ids: string[]): void
   openPanel(parentSessionId: string): void
+  refreshList(parent: string, afterMutation?: boolean): Promise<boolean>
   closePanel(): void
   /** Install (or clear) the dock-mode launcher; openPanel() fires it after opening. */
   setDockLaunch(fn: (() => void) | null): void
@@ -163,6 +169,9 @@ function emptyPanel(): PanelState {
     parentSessionId: '',
     activeChildId: null,
     items: [],
+    listKnown: false,
+    listError: null,
+    pastItems: null,
     messages: [],
     draft: '',
     attachment: null,
@@ -215,7 +224,13 @@ function createStore(): SidechatStore {
     for (const fn of [...listeners]) fn()
   }
 
+  const lists = createListReader(
+    (parentSessionId) => api.list({ parentSessionId }),
+    (items) => { panel = { ...panel, items, listKnown: true, listError: null }; notify() },
+    (listError) => { panel = { ...panel, listError }; notify() },
+  )
   return {
+    refreshList: lists.refresh,
     getSnapshot: () => snapshot,
     subscribe: (fn) => {
       listeners.add(fn)
@@ -223,7 +238,10 @@ function createStore(): SidechatStore {
     },
     setCurrent(next) {
       if (next === current) return
-      if (current !== undefined) bySession.set(current, panel)
+      // Remember view state and drafts, not a list that can move or change
+      // ownership while we are in another conversation (e.g. after rewind).
+      if (current !== undefined) bySession.set(current, { ...panel, items: [], listKnown: false, listError: null, pastItems: null })
+      lists.setParent(next)
       current = next
       panel = next === undefined
         ? emptyPanel()
@@ -275,7 +293,8 @@ function createStore(): SidechatStore {
       notify()
     },
     openPanel(parentSessionId) {
-      panel = { ...panel, open: true, parentSessionId }
+      if (panel.parentSessionId !== parentSessionId) return
+      panel = { ...panel, open: true }
       dockLaunch?.()
       notify()
     },
@@ -388,12 +407,6 @@ function base64ObjectUrl(mediaType: string, data: string): string {
   return URL.createObjectURL(new Blob([bytes], { type: mediaType }))
 }
 
-/** Pull the side-chat list for one parent conversation. */
-async function refreshList(store: SidechatStore, parentSessionId: string): Promise<void> {
-  const result = await api.list({ parentSessionId })
-  if (result.ok) store.patch({ items: result.value.items })
-}
-
 /** Optimistically flip one side-chat's running flag before the list round-trip. */
 function setItemRunning(store: SidechatStore, childId: string, running: boolean): void {
   const items = store.getSnapshot().panel.items
@@ -403,7 +416,7 @@ function setItemRunning(store: SidechatStore, childId: string, running: boolean)
 /** Pull the active side chat's transcript. */
 async function refreshHistory(store: SidechatStore, childId: string): Promise<void> {
   const result = await api.history({ childId })
-  if (result.ok) store.patch({ messages: result.value.messages })
+  if (result.ok && store.getSnapshot().panel.activeChildId === childId) store.patch({ messages: result.value.messages })
 }
 
 /** Pull the model directory + permission catalog once. */
@@ -460,11 +473,6 @@ function CopyReplyButton(props: { text: string; t: (key: SidechatLocaleKey) => s
   )
 }
 
-/** The name a side chat is shown by: its user-given name, else its id. */
-function itemName(item: SidechatListItem): string {
-  return item.name ?? item.childId
-}
-
 /**
  * One row of the side-chat list: select, copy its name, rename it in place
  * (pencil or double-click; Enter/blur saves, Escape cancels, empty clears),
@@ -472,6 +480,7 @@ function itemName(item: SidechatListItem): string {
  */
 function SidechatListRow(props: {
   item: SidechatListItem
+  label: string
   active: boolean
   t: (key: SidechatLocaleKey) => string
   onSelect: () => void
@@ -479,7 +488,7 @@ function SidechatListRow(props: {
   onDispose: () => void
 }) {
   const { item, t } = props
-  const name = itemName(item)
+  const name = props.label
   const { copied, onCopy } = useCopyText(name)
   const [editing, setEditing] = useState(false)
   const [draft, setDraft] = useState('')
@@ -590,33 +599,42 @@ function SidechatListRow(props: {
 function PastSideChats(props: {
   parentSessionId: string
   t: (key: SidechatLocaleKey) => string
-  onOpen: (item: SidechatPastItem) => void
+  items: SidechatPastItem[] | null
+  live: SidechatListItem[]
+  store: SidechatStore
+  onOpen: (item: SidechatPastItem) => Promise<void>
 }) {
   const { t } = props
-  const [items, setItems] = useState<SidechatPastItem[] | null>(null)
+  const [fresh, setFresh] = useState(false)
+  const items = useMemo(() => fresh ? props.items ?? [] : provisionalPastRows(props.live, props.items), [fresh, props.live, props.items])
+  const listed = useMemo(() => new Set(props.live.map((row) => row.childId)), [props.live])
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
-    setItems(null)
-    setError(null)
+    // Keep already known rows visible while checking their current status.
     void api.past({ parentSessionId: props.parentSessionId }).then((result) => {
-      if (cancelled) return
-      if (result.ok) setItems(result.value.items)
-      else setError(result.error.message)
+      if (cancelled || props.store.getSnapshot().panel.parentSessionId !== props.parentSessionId) return
+      if (result.ok) {
+        props.store.patch({ pastItems: result.value.items })
+        setFresh(true)
+      } else setError(result.error.message)
+    }).catch((reason: unknown) => {
+      if (!cancelled) setError(reason instanceof Error ? reason.message : String(reason))
     })
     return () => { cancelled = true }
-  }, [props.parentSessionId])
+  }, [props.parentSessionId, props.store])
 
-  if (error !== null) return <div className={css.panelEmpty} data-testid="sidechat-past-error">{error}</div>
-  if (items === null) return <div className={css.panelEmpty} data-testid="sidechat-past-loading">{t('past.loading')}</div>
+  if (items.length === 0 && error !== null) return <div className={css.panelEmpty} data-testid="sidechat-past-error">{error}</div>
+  if (!fresh && items.length === 0) return <div className={css.panelEmpty} data-testid="sidechat-past-loading">{t('past.loading')}</div>
   if (items.length === 0) return <div className={css.panelEmpty} data-testid="sidechat-past-empty">{t('past.empty')}</div>
   return (
-    <div className={css.pastList} data-testid="sidechat-past-list">
-      <div className={css.pastTitle}>{t('past.title')}</div>
+    <div className={css.pastList} data-testid="sidechat-past-list" aria-busy={!fresh && error === null}>
+      <div className={css.pastTitle}>{t('past.title')}{!fresh && error === null && ` · ${t('past.loading')}`}</div>
+      {error !== null && <div className={css.panelEmpty} role="status" data-testid="sidechat-past-error">{error}</div>}
       {items.map((item) => {
-        const label = item.name ?? (item.preview !== '' ? item.preview : item.childId)
+        const label = chatTitle(item, t('panel.untitled'))
         const when = item.createdAt > 0 ? new Date(item.createdAt).toLocaleString() : ''
         return (
           <div key={item.childId} className={css.pastRow} data-testid="sidechat-past-row" data-status={item.status}>
@@ -630,11 +648,11 @@ function PastSideChats(props: {
             <button
               type="button"
               className={css.pastOpen}
-              disabled={busy !== null}
+              disabled={(!fresh && !listed.has(item.childId)) || busy !== null}
               data-testid="sidechat-past-open"
               onClick={() => {
                 setBusy(item.childId)
-                props.onOpen(item)
+                void props.onOpen(item).finally(() => { setBusy(null) })
               }}
             >
               {item.status === 'listed' ? t('past.open') : t('past.restore')}
@@ -1149,7 +1167,7 @@ function SelectionMenu(props: { store: SidechatStore; t: (key: SidechatLocaleKey
         ...(snap.model !== '' ? { model: snap.model } : {}),
         ...(snap.effort !== '' ? { reasoningEffort: snap.effort } : {}),
       }).then((result) => {
-        if (result.ok) {
+        if (result.ok && props.store.getSnapshot().current === parentSessionId) {
           props.store.openPanel(parentSessionId)
           props.store.setActive(result.value.childId)
           props.store.patch({
@@ -1157,7 +1175,7 @@ function SelectionMenu(props: { store: SidechatStore; t: (key: SidechatLocaleKey
             model: result.value.model,
             effort: result.value.reasoningEffort ?? '',
           })
-          void refreshList(props.store, parentSessionId)
+          void props.store.refreshList(parentSessionId, true)
           void refreshDirectory(props.store)
         }
       })
@@ -1182,7 +1200,7 @@ function SelectionMenu(props: { store: SidechatStore; t: (key: SidechatLocaleKey
       setItemRunning(props.store, active, true)
       void api.followup({ childId: active, content, lookupEnabled: prefs.lookupDefault }).then((result) => {
         if (!result.ok) props.store.patch({ error: result.error.message })
-        void refreshList(props.store, parentSessionId)
+        void props.store.refreshList(parentSessionId, true)
         void refreshHistory(props.store, active)
       })
     } else {
@@ -1680,6 +1698,10 @@ function SidechatPanel(props: {
   }
 
   const activeItem = panel.items.find((i) => i.childId === panel.activeChildId)
+  const archiveItem = panel.pastItems?.find(i => i.childId === panel.activeChildId)
+  const untitled = props.t('panel.untitled')
+  // A restored row can be selected before the live list has refreshed.
+  const activeTitle = chatTitle(activeItem ? { ...activeItem, preview: activeItem.preview || archiveItem?.preview } : archiveItem, untitled, panel.messages)
   const activeRunning = activeItem?.running ?? false
   /** The composer holds something sendable (text, a quote, or images). */
   const hasDraft = panel.draft.trim() !== '' || (panel.attachment !== null && panel.attachment.trim() !== '') || panel.attachments.length > 0
@@ -1777,7 +1799,7 @@ function SidechatPanel(props: {
       const snap = props.store.getSnapshot().panel
       const childId = snap.activeChildId
       if (childId === null) return
-      void refreshList(props.store, snap.parentSessionId)
+      void props.store.refreshList(snap.parentSessionId)
       void refreshHistory(props.store, childId)
     }
     tick()
@@ -1814,6 +1836,7 @@ function SidechatPanel(props: {
           ...(panel.preset !== '' ? { preset: panel.preset } : {}),
           ...(quoted !== '' ? { name: quoted } : {}),
         }).then((result) => {
+          if (props.store.getSnapshot().panel.parentSessionId !== panel.parentSessionId) return
           if (result.ok) {
             props.store.setActive(result.value.childId)
             props.store.patch({
@@ -1821,7 +1844,7 @@ function SidechatPanel(props: {
               model: result.value.model,
               effort: result.value.reasoningEffort ?? '',
             })
-            void refreshList(props.store, panel.parentSessionId)
+            void props.store.refreshList(panel.parentSessionId, true)
             void refreshDirectory(props.store)
           } else {
             props.store.patch({ error: result.error.message })
@@ -1851,7 +1874,7 @@ function SidechatPanel(props: {
           if (!activeRunning) setItemRunning(props.store, childId, false)
           props.store.patch({ error: result.error.message })
         }
-        void refreshList(props.store, panel.parentSessionId)
+        void props.store.refreshList(panel.parentSessionId, true)
         void refreshHistory(props.store, childId)
       })
     }).catch((error: unknown) => {
@@ -1866,7 +1889,7 @@ function SidechatPanel(props: {
     // Stopping clears the side chat's queued and steering messages on the host.
     setPending([])
     void api.stop({ childId }).then(() => {
-      void refreshList(props.store, panel.parentSessionId)
+      void props.store.refreshList(panel.parentSessionId, true)
       void refreshHistory(props.store, childId)
     })
   }, [panel, props.store])
@@ -1894,16 +1917,17 @@ function SidechatPanel(props: {
     if (panel.activeChildId === null) return
     const childId = panel.activeChildId
     void api.dispose({ childId }).then(() => {
-      void refreshList(props.store, panel.parentSessionId)
-      props.store.patch({ activeChildId: null, messages: [] })
+      if (props.store.getSnapshot().panel.parentSessionId !== panel.parentSessionId) return
+      void props.store.refreshList(panel.parentSessionId, true)
+      if (props.store.getSnapshot().panel.activeChildId === childId) props.store.patch({ activeChildId: null, messages: [] })
     })
   }, [panel, props.store])
 
   /** Delete one side chat from the list. */
   const disposeItem = useCallback((childId: string) => {
     void api.dispose({ childId }).then(() => {
-      void refreshList(props.store, panel.parentSessionId)
-      if (panel.activeChildId === childId) {
+      void props.store.refreshList(panel.parentSessionId, true)
+      if (props.store.getSnapshot().panel.parentSessionId === panel.parentSessionId && props.store.getSnapshot().panel.activeChildId === childId) {
         props.store.patch({ activeChildId: null, messages: [] })
       }
     })
@@ -1923,26 +1947,31 @@ function SidechatPanel(props: {
     const parentSessionId = panel.parentSessionId
     void api.rename({ childId, name }).then((result) => {
       if (!result.ok) props.store.patch({ error: result.error.message })
-      void refreshList(props.store, parentSessionId)
+      void props.store.refreshList(parentSessionId, true)
     })
   }, [panel.parentSessionId, props.store])
 
   /** Bring one past side chat back into this conversation's list and open it. */
-  const openPast = useCallback((item: SidechatPastItem) => {
+  const openPast = useCallback(async (item: SidechatPastItem) => {
     const parentSessionId = panel.parentSessionId
-    void (async () => {
+    try {
       if (item.status !== 'listed') {
         const result = await api.reopen({ childId: item.childId, parentSessionId })
+        if (props.store.getSnapshot().panel.parentSessionId !== parentSessionId) return
         if (!result.ok) {
           props.store.patch({ error: `${props.t('past.failed')}: ${result.error.message}` })
           return
         }
       }
-      await refreshList(props.store, parentSessionId)
       props.store.setActive(item.childId)
       props.store.patch({ pastOpen: false })
+      void props.store.refreshList(parentSessionId, item.status !== 'listed')
       void refreshHistory(props.store, item.childId)
-    })()
+    } catch (reason) {
+      if (props.store.getSnapshot().panel.parentSessionId === parentSessionId) {
+        props.store.patch({ error: `${props.t('past.failed')}: ${reason instanceof Error ? reason.message : String(reason)}` })
+      }
+    }
   }, [panel.parentSessionId, props.store, props.t])
 
   /** Delete every side chat of this conversation at once. */
@@ -1950,7 +1979,8 @@ function SidechatPanel(props: {
     const ids = panel.items.map((i) => i.childId)
     if (ids.length === 0) return
     void Promise.all(ids.map((id) => api.dispose({ childId: id }))).then(() => {
-      void refreshList(props.store, panel.parentSessionId)
+      if (props.store.getSnapshot().panel.parentSessionId !== panel.parentSessionId) return
+      void props.store.refreshList(panel.parentSessionId, true)
       props.store.patch({ activeChildId: null, messages: [] })
     })
   }, [panel.items, panel.parentSessionId, props.store])
@@ -2120,16 +2150,18 @@ function SidechatPanel(props: {
       data-sidechat-panel={props.embedded ? 'embedded' : 'floating'}
     >
       {!props.embedded && <div className={css.panelResize} onMouseDown={startResize} />}
-      {!props.embedded && (
+      {(!props.embedded || panel.activeChildId !== null) && (
         <div className={css.panelHeader}>
-          <span className={css.panelTitle}>{props.t('panel.title')}</span>
-          <div className={css.panelHeaderActions}>
+          <span className={css.panelTitle} data-testid="sidechat-title" title={panel.activeChildId === null ? undefined : activeTitle}>
+            {panel.activeChildId === null ? props.t('panel.title') : activeTitle}
+          </span>
+          {!props.embedded && <div className={css.panelHeaderActions}>
             <Tooltip label={props.t('panel.collapse')} side="bottom">
               <button type="button" className={css.panelIconButton} onClick={() => { setCollapsed(true) }}>
                 <IconPanelLeftOutlineRegular size={16} />
               </button>
             </Tooltip>
-          </div>
+          </div>}
         </div>
       )}
 
@@ -2249,15 +2281,16 @@ function SidechatPanel(props: {
           )}
         </div>
         {panel.pastOpen
-          ? <PastSideChats parentSessionId={panel.parentSessionId} t={props.t} onOpen={openPast} />
+          ? <PastSideChats key={panel.parentSessionId} live={panel.items} items={panel.pastItems} store={props.store} parentSessionId={panel.parentSessionId} t={props.t} onOpen={openPast} />
           : panel.items.length === 0
-          ? <div className={css.panelEmpty}>{props.t('panel.empty')}</div>
+          ? <div className={css.panelEmpty}>{panel.listError ?? props.t(panel.listKnown ? 'panel.empty' : 'past.loading')}</div>
           : (
               <>
                 {panel.items.map((item) => (
                   <SidechatListRow
                     key={item.childId}
                     item={item}
+                    label={item.childId === panel.activeChildId ? activeTitle : chatTitle(item, untitled)}
                     active={item.childId === panel.activeChildId}
                     t={props.t}
                     onSelect={() => { props.store.setActive(item.childId); void refreshHistory(props.store, item.childId) }}
@@ -2838,10 +2871,11 @@ export function apply(ctx: Context): void {
         ...(panel.effort !== '' ? { reasoningEffort: panel.effort } : {}),
       })
       if (result.ok) {
+        if (store.getSnapshot().current !== parentSessionId) return true
         store.openPanel(parentSessionId)
         store.setActive(result.value.childId)
         store.patch({ provider: result.value.provider, model: result.value.model, effort: result.value.reasoningEffort ?? '' })
-        void refreshList(store, parentSessionId)
+        void store.refreshList(parentSessionId, true)
         void refreshDirectory(store)
         return true
       }
@@ -2856,7 +2890,7 @@ export function apply(ctx: Context): void {
       setItemRunning(store, childId, false)
       store.patch({ error: result.error.message })
     }
-    void refreshList(store, parentSessionId)
+    void store.refreshList(parentSessionId, true)
     void refreshHistory(store, childId)
     return result.ok
   }
@@ -2878,10 +2912,11 @@ export function apply(ctx: Context): void {
       ...(panel.effort !== '' ? { reasoningEffort: panel.effort } : {}),
     })
     if (result.ok) {
+      if (store.getSnapshot().current !== parentSessionId) return true
       store.openPanel(parentSessionId)
       store.setActive(result.value.childId)
       store.patch({ provider: result.value.provider, model: result.value.model, effort: result.value.reasoningEffort ?? '' })
-      void refreshList(store, parentSessionId)
+      void store.refreshList(parentSessionId, true)
       void refreshDirectory(store)
       return true
     }
@@ -2914,9 +2949,9 @@ export function apply(ctx: Context): void {
         run: (session) => {
           const sessionId = session.sessionId
           store.openPanel(sessionId)
-          void refreshList(store, sessionId).then(() => {
+          const selectDefault = (): void => {
             const panel = store.getSnapshot().panel
-            if (panel.parentSessionId !== sessionId || panel.activeChildId !== null) return
+            if (panel.parentSessionId !== sessionId || !panel.open || panel.pastOpen || panel.activeChildId !== null) return
             // Nothing selected yet: show the newest side chat, or the past list
             // when this conversation has none listed (e.g. all were closed).
             const newest = panel.items[panel.items.length - 1]
@@ -2926,7 +2961,12 @@ export function apply(ctx: Context): void {
             } else {
               store.patch({ pastOpen: true })
             }
-          })
+          }
+          // The session subscription often already has the list. Show it now;
+          // otherwise join its in-flight read instead of fetching twice.
+          const known = store.getSnapshot().panel.listKnown
+          if (known) selectDefault()
+          void store.refreshList(sessionId).then((fresh) => { if (!known && fresh) selectDefault() })
         },
       },
     }), 'dsh-side-chat: + menu entry')
@@ -3004,7 +3044,8 @@ export function apply(ctx: Context): void {
       const previous = store.getSnapshot().panel
       store.setCurrent(next)
       if (next === undefined) return
-      void refreshList(store, next).then(() => {
+      void store.refreshList(next).then((fresh) => {
+        if (!fresh) return
         const now = store.getSnapshot()
         if (now.current !== next || now.panel.activeChildId !== null) return
         const carried = previous.activeChildId

@@ -7,7 +7,7 @@
  * list and the ones from an earlier version of the conversation — and only
  * those: side chats of any other conversation never show up.
  */
-import { mkdir, rm } from 'node:fs/promises'
+import { mkdir, rm, writeFile } from 'node:fs/promises'
 import { Readable } from 'node:stream'
 import { beforeEach, expect, test, vi } from 'vitest'
 
@@ -52,7 +52,9 @@ function mount() {
 
   const ctx: any = {
     fiber: { entry: { options: { id: 'side-chat-entry' } } },
-    get: () => undefined,
+    get: (service: string) => service === 'sessionPersistence' ? {
+      stat: async (id: string) => { log.push(`stat:${id}`); return headers.get(id) },
+    } : undefined,
     inject: () => {},
     on: (name: string, fn: (event: unknown) => void) => { listeners.set(name, fn); return () => { listeners.delete(name) } },
     effect: (callback: () => unknown, label?: string) => {
@@ -78,7 +80,17 @@ function mount() {
       },
     },
     sessionQuery: {
+      listSessions: async () => {
+        log.push('list-headers')
+        return [...headers].map(([id, h]) => ({ header: { id, ...h } }))
+      },
+      observeSession: async (id: string) => {
+        log.push(`observe:${id}`)
+        const view = await ctx.sessionQuery.readSession(id)
+        return { events: view.events, [Symbol.dispose]: () => log.push(`release:${id}`) }
+      },
       readSession: async (id: string) => {
+        log.push(`read:${id}`)
         const header = headers.get(id)
         if (header === undefined) throw new Error('not found')
         return { session: header, events: [{ type: 'user/message', seq: 0, time: header.createdAt, data: { content: [{ type: 'text', text: `prompt of ${id}` }] } }] }
@@ -116,13 +128,6 @@ const start = async (m: ReturnType<typeof mount>, parentSessionId: string, text:
   (await m.call('sidechat.start', { parentSessionId, content: [{ type: 'text', text }] })).body.value.childId
 const ids = (items: Array<{ childId: string }>) => items.map((i) => i.childId)
 
-/** Lay the side-chat sessions out on disk the way DSH stores them (`sessions/<cwd slug>/<id>`). */
-async function writeStore(existingParents: string[]): Promise<void> {
-  for (const id of [...headers.keys(), ...existingParents]) {
-    await mkdir(`${home}/sessions/--work--/${id}`, { recursive: true })
-  }
-}
-
 test('a rewound conversation keeps its side chats, and they resume on the successor', async () => {
   const m = mount()
   const a = await start(m, 'parent-1', 'one')
@@ -155,8 +160,7 @@ test('all past side chats: listed, closed, and from before an edit can be reopen
   m.emit(REWOUND_EVENT, { sourceSessionId: 'parent-1', sessionId: 'parent-2', action: 'edit' })
   await flush()
   await m.call('sidechat.dispose', { childId: closedNow })
-  // parent-1 was purged by the rewind.
-  await writeStore(['session-dummy', 'parent-2', 'parent-3'])
+  // The catalog has no parent-1 header: a rewind purged it.
 
   const past = (await m.call('sidechat.past', { parentSessionId: 'parent-2' })).body.value.items
   const byId = new Map(past.map((i: any) => [i.childId, i]))
@@ -165,13 +169,14 @@ test('all past side chats: listed, closed, and from before an edit can be reopen
   expect((byId.get(closedEarlier) as any)?.status).toBe('earlier')
   // Its header still names the pre-edit session, so it reads as "before an edit".
   expect((byId.get(closedNow) as any)?.status).toBe('earlier')
-  expect((byId.get(closedEarlier) as any)?.preview).toBe(`prompt of ${closedEarlier}`)
+  expect((byId.get(closedEarlier) as any)?.preview).toBe('closed before the edit')
 
   for (const childId of [closedEarlier, closedNow]) {
     expect((await m.call('sidechat.reopen', { childId, parentSessionId: 'parent-2' })).status).toBe(200)
   }
-  expect(new Set(ids((await m.call('sidechat.list', { parentSessionId: 'parent-2' })).body.value.items)))
-    .toEqual(new Set([listed, closedEarlier, closedNow]))
+  const reopened = (await m.call('sidechat.list', { parentSessionId: 'parent-2' })).body.value.items
+  expect(new Set(ids(reopened))).toEqual(new Set([listed, closedEarlier, closedNow]))
+  expect(reopened).toContainEqual({ childId: closedEarlier, preview: 'closed before the edit', running: false })
   expect((await m.call('sidechat.reopen', { childId: '../etc', parentSessionId: 'parent-2' })).status).toBe(400)
   await flush() // let the background saves finish before the next test wipes the folder
 })
@@ -186,8 +191,7 @@ test('all past side chats never lists side chats of another conversation', async
   await m.call('sidechat.dispose', { childId: otherClosed })
   await m.call('sidechat.dispose', { childId: fromDeletedClosed })
   await flush()
-  // parent-3 is gone from disk with no successor: its side chats used to be offered everywhere.
-  await writeStore(['parent-1', 'parent-2'])
+  // No parent-3 header or successor exists: its side chats used to be offered everywhere.
 
   expect(ids((await m.call('sidechat.past', { parentSessionId: 'parent-1' })).body.value.items)).toEqual([mine])
   expect(new Set(ids((await m.call('sidechat.past', { parentSessionId: 'parent-2' })).body.value.items)))
@@ -196,4 +200,55 @@ test('all past side chats never lists side chats of another conversation', async
   // They still belong to their own conversation.
   expect(new Set(ids((await m.call('sidechat.past', { parentSessionId: 'parent-3' })).body.value.items)))
     .toEqual(new Set([fromDeleted, fromDeletedClosed]))
+})
+
+test('legacy discovery imports headers once, reads only matching previews, and survives restart', async () => {
+  // A real pre-index installation: its active list has one recorded chat, but
+  // only the session store knows about the closed chats and their owners.
+  await mkdir(home, { recursive: true })
+  const mine = 'subchat-mine'
+  const closed = 'subchat-closed'
+  const records = Array.from({ length: 150 }, (_, i) => ({ childId: `subchat-other-${i}`, parentSessionId: 'parent-2', createdAt: i }))
+  records.push({ childId: mine, parentSessionId: 'parent-1', createdAt: 2 })
+  await writeFile(`${home}/dsh-side-chat-sessions.json`, JSON.stringify(records))
+  for (const r of records) headers.set(r.childId, { parentSession: r.parentSessionId, createdAt: r.createdAt })
+  headers.set(closed, { parentSession: 'parent-1', createdAt: 1 })
+  const m = mount()
+  const call = (method: string) => m.call(method, { parentSessionId: 'parent-1' }).then(r => r.body.value.items)
+  expect(ids(await call('sidechat.list'))).toEqual([mine])
+  expect(m.log).toEqual([`stat:${mine}`]) // No full logs, no discovery, no unrelated ID checks.
+  const [past, duplicate] = await Promise.all([call('sidechat.past'), call('sidechat.past')])
+  expect(duplicate).toEqual(past)
+  expect(past.map((r: any) => [r.childId, r.preview, r.status])).toEqual([
+    [mine, `prompt of ${mine}`, 'listed'], [closed, `prompt of ${closed}`, 'closed'],
+  ])
+  expect(m.log.filter(s => s === 'list-headers')).toHaveLength(1)
+  expect(m.log.filter(s => s.startsWith('read:'))).toEqual([`read:${mine}`, `read:${closed}`])
+  expect(m.log.filter(s => s.startsWith('release:'))).toEqual([`release:${mine}`, `release:${closed}`])
+  m.log.length = 0
+  await call('sidechat.past')
+  expect(m.log).toEqual([])
+
+  const restarted = mount()
+  headers.delete(closed)
+  const after = await restarted.call('sidechat.past', { parentSessionId: 'parent-1' })
+  expect(after.body.value.items).toEqual([past[0]])
+  expect(restarted.log).toEqual([`stat:${mine}`, `stat:${closed}`]) // No corpus scan or replay on restart.
+})
+
+test('an invalid index is rebuilt; a listed row missing from a valid index is repaired locally', async () => {
+  const childId = 'subchat-legacy'
+  headers.set(childId, { parentSession: 'parent-1', createdAt: 12 })
+  await mkdir(home, { recursive: true })
+  const path = `${home}/dsh-side-chat-past-v1.json`
+  await writeFile(path, JSON.stringify({ version: 1, imported: true, rows: [null] }))
+  await writeFile(`${home}/dsh-side-chat-sessions.json`, JSON.stringify([{ childId, parentSessionId: 'parent-2', createdAt: 12 }]))
+  for (const expectScan of [true, false]) {
+    if (!expectScan) await writeFile(path, JSON.stringify({ version: 1, imported: true, rows: [] }))
+    const m = mount()
+    const past = await m.call('sidechat.past', { parentSessionId: 'parent-2' })
+    expect(past.body.value.items).toEqual([{ childId, createdAt: 12, status: 'listed', preview: `prompt of ${childId}` }])
+    expect(m.log.includes('list-headers')).toBe(expectScan)
+    expect((await m.call('sidechat.past', { parentSessionId: 'parent-1' })).body.value.items).toEqual([])
+  }
 })

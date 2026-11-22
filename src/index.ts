@@ -17,8 +17,8 @@
  * or trusted authority; cross-site markers refuse).
  */
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
-import { dirname, join } from 'node:path'
+import { mkdir, readFile, writeFile } from 'node:fs/promises'
+import { dirname } from 'node:path'
 import * as agentApi from '@deepseek-ai/dsh-agent'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import { SettingsConflictError } from '@deepseek-ai/dsh-settings'
@@ -36,6 +36,7 @@ import type {
   SideSession,
   SideSessionEvent,
 } from './context-types.ts'
+import { PastIndex, SIDECHAT_ID, type PastRecord } from './past-index.ts'
 import { SUBCHAT_PREFS_DEFAULTS, type SubchatPrefs } from './settings-shared.ts'
 import { DEFAULT_TRUST_PROTOCOL, isTrustedApiRequest, type ApiTrustProtocol } from './trust-fence.ts'
 import { optionalBoolean, readJsonBody, requireString, SidechatError, writeError, writeJson, writeOk } from './wire.ts'
@@ -288,39 +289,6 @@ async function writeLineage(steps: LineageStep[]): Promise<void> {
   await writeFile(path, JSON.stringify(steps, null, 2), 'utf8')
 }
 
-/** Side-chat session ids are minted as `subchat-<uuid>`; refuse anything else. */
-const SIDECHAT_ID = /^subchat-[0-9a-zA-Z]+(?:-[0-9a-zA-Z]+)*$/
-
-/** Scan the session store on disk for every side-chat session id. */
-async function scanSidechatIds(): Promise<string[]> {
-  const root = dshHomePath('sessions')
-  const sidechatIds: string[] = []
-  let entries
-  try {
-    entries = await readdir(root, { withFileTypes: true })
-  } catch {
-    return sidechatIds
-  }
-  const visit = (name: string): void => {
-    if (SIDECHAT_ID.test(name)) sidechatIds.push(name)
-  }
-  for (const entry of entries) {
-    if (!entry.isDirectory()) continue
-    if (entry.name.startsWith('session-') || entry.name.startsWith('subchat-')) {
-      visit(entry.name)
-      continue
-    }
-    let inner
-    try {
-      inner = await readdir(join(root, entry.name), { withFileTypes: true })
-    } catch {
-      continue
-    }
-    for (const child of inner) if (child.isDirectory()) visit(child.name)
-  }
-  return sidechatIds
-}
-
 /** One row of the "all past side chats" view. */
 interface PastItem {
   childId: string
@@ -442,6 +410,16 @@ function foldTranscript(events: readonly { type: string; data: Record<string, un
   return messages
 }
 
+/** Stop at the first visible user message; history may contain very large later turns. */
+function firstPromptPreview(events: readonly { type: string; data: Record<string, unknown> }[]): string | undefined {
+  for (const event of events) {
+    if (event.type !== 'user/message') continue
+    const first = foldTranscript([event])[0]
+    if (first) return first.blocks.map(b => b.type === 'text' ? b.text : '').join(' ').replace(/\s+/g, ' ').trim().slice(0, 160)
+  }
+  return undefined
+}
+
 /** The start time of the still-open turn, or undefined when no turn is running. */
 function openTurnStart(events: readonly SideSessionEvent[]): number | undefined {
   let lastStart: number | undefined
@@ -485,12 +463,6 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   const loaded: Promise<void> = (async () => {
     for (const record of await readRecords()) {
       if (sideChats.has(record.childId) || dormant.has(record.childId)) continue
-      // Drop records whose session no longer exists (deleted elsewhere).
-      try {
-        await ctx.sessionQuery.readSession(record.childId)
-      } catch {
-        continue
-      }
       dormant.set(record.childId, record)
     }
   })().catch((error: unknown) => {
@@ -519,6 +491,45 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     }).catch((error: unknown) => {
       console.warn('[dsh-side-chat] record write failed:', error instanceof Error ? error.message : String(error))
     })
+  }
+
+  const pastIndex = new PastIndex(dshHomePath('dsh-side-chat-past-v1.json'))
+
+  // Prefer point metadata reads. If the backend has no stat capability, share
+  // a single header listing across legacy validation rather than replaying logs.
+  const availabilityTtl = 60_000
+  let fallbackIds: Promise<Set<string>> | undefined
+  let fallbackExpires = 0
+  const probe = async (id: string): Promise<boolean> => {
+    if (ctx.sessions.get(id) !== undefined) return true
+    const store = ctx.get('sessionPersistence') as { stat?(id: string): Promise<unknown> } | undefined
+    if (typeof store?.stat === 'function') return (await store.stat(id)) !== undefined
+    if (!fallbackIds || Date.now() >= fallbackExpires) {
+      fallbackExpires = Infinity // Share slow/in-flight listings as well.
+      fallbackIds = ctx.sessionQuery.listSessions().then(rows => {
+        fallbackExpires = Date.now() + availabilityTtl
+        return new Set(rows.map(({ header }) => header.id))
+      }).catch(error => { fallbackIds = undefined; throw error })
+    }
+    return (await fallbackIds).has(id)
+  }
+
+  // Parent-scoped checks are shared across concurrent list/past calls. Warm
+  // polling performs no I/O, but an out-of-band deletion eventually expires.
+  const verified = new Map<string, number>()
+  const checking = new Map<string, Promise<boolean>>()
+  const exists = (id: string): Promise<boolean> => {
+    if ((verified.get(id) ?? 0) > Date.now()) return Promise.resolve(true)
+    let result = checking.get(id)
+    if (!result) {
+      result = probe(id).then(found => {
+        if (found) verified.set(id, Date.now() + availabilityTtl)
+        else if (dormant.delete(id)) persist()
+        return found
+      }).finally(() => { checking.delete(id) })
+      checking.set(id, result)
+    }
+    return result
   }
 
   /** Narrow a payload value to a non-empty prompt content array. */
@@ -965,7 +976,17 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     sideChats.set(childId, child)
     persist()
 
-    await deliver(child, userMessage(blocks))
+    await pastIndex.ready
+    const pastRow: PastRecord = { childId, parentSessionId, createdAt: child.createdAt }
+    pastIndex.rows.set(childId, pastRow)
+    if (fallbackIds) void fallbackIds.then(ids => ids.add(childId), () => {})
+    try {
+      await deliver(child, userMessage(blocks))
+      pastRow.preview = firstPromptPreview([{ type: 'user/message', data: { content: blocks } }]) ?? ''
+    } finally {
+      // Even a failed delivery leaves a real session on disk, discoverable after close/restart.
+      await pastIndex.save()
+    }
     return { childId, provider, model, ...(reasoningEffort === undefined ? {} : { reasoningEffort }) }
   }
 
@@ -995,9 +1016,19 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
   const steer = (payload: unknown): Promise<{ accepted: true }> => deliverLater(payload, 'steer')
 
   /** List the side chats launched by one parent conversation. */
-  const list = async (payload: unknown): Promise<{ items: Array<{ childId: string; name?: string; running: boolean; runningSince?: number }> }> => {
+  const list = async (payload: unknown) => {
     const parentSessionId = requireString(payload, 'parentSessionId')
-    const items: Array<{ childId: string; name?: string; running: boolean; runningSince?: number }> = []
+    await Promise.all([loaded, pastIndex.ready])
+    // Only use already-indexed titles; opening the list must not replay untouched chats.
+    const labelOf = (record: { childId: string; name?: string }): { name?: string; preview?: string } => {
+      if (record.name !== undefined) return { name: record.name }
+      const preview = pastIndex.rows.get(record.childId)?.preview
+      return preview ? { preview } : {}
+    }
+    for (const record of dormant.values()) {
+      if (record.parentSessionId === parentSessionId) await exists(record.childId)
+    }
+    const items: Array<{ childId: string; name?: string; preview?: string; running: boolean; runningSince?: number }> = []
     for (const record of sideChats.values()) {
       if (record.parentSessionId !== parentSessionId) continue
       const agent = record.handle.agent
@@ -1016,16 +1047,15 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
       const runningSince = running ? (eventRunningSince ?? Date.now()) : undefined
       items.push({
         childId: record.childId,
-        ...(record.name === undefined ? {} : { name: record.name }),
+        ...labelOf(record),
         running,
         ...(runningSince !== undefined ? { runningSince } : {}),
       })
     }
     // Side chats from an earlier run stay listed (idle) until reopened.
-    await loaded
     for (const record of dormant.values()) {
       if (record.parentSessionId !== parentSessionId || sideChats.has(record.childId)) continue
-      items.push({ childId: record.childId, ...(record.name === undefined ? {} : { name: record.name }), running: false })
+      items.push({ childId: record.childId, ...labelOf(record), running: false })
     }
     const createdAt = (id: string): number => sideChats.get(id)?.createdAt ?? dormant.get(id)?.createdAt ?? 0
     items.sort((a, b) => createdAt(a.childId) - createdAt(b.childId))
@@ -1223,29 +1253,33 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     return { moved }
   }
 
-  /** Header + first prompt of one side-chat session (never changes; cached). */
-  const headerCache = new Map<string, { parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null>()
-  const sidechatHeader = async (childId: string): Promise<{ parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null> => {
-    const cached = headerCache.get(childId)
-    if (cached !== undefined) return cached
-    let value: { parentSessionId?: string; cwd?: string; createdAt: number; preview: string } | null
-    try {
-      const read = await ctx.sessionQuery.readSession(childId)
-      const header = read.session
-      const firstUser = foldTranscript(read.events).find((m) => m.role === 'user')
-      const text = firstUser?.blocks.map((b) => (b.type === 'text' ? b.text : '')).join(' ') ?? ''
-      value = {
-        ...(header.parentSession === undefined ? {} : { parentSessionId: header.parentSession }),
-        ...(header.cwd === undefined ? {} : { cwd: header.cwd }),
-        createdAt: typeof header.createdAt === 'number' ? header.createdAt : (read.events[0]?.time ?? 0),
-        preview: text.replace(/\s+/g, ' ').trim().slice(0, 160),
+  // Import pre-index chats (including closed ones) using detached headers, not
+  // directory traversal or log replay. Newly created chats are indexed by start.
+  const importPast = async (): Promise<PastRecord[]> => {
+    const rows: PastRecord[] = []
+    for (const { header } of await ctx.sessionQuery.listSessions()) {
+      if (SIDECHAT_ID.test(header.id) && header.parentSession !== undefined) {
+        verified.set(header.id, Date.now() + availabilityTtl)
+        rows.push({ childId: header.id, parentSessionId: header.parentSession, createdAt: header.createdAt ?? 0 })
       }
-    } catch {
-      value = null
     }
-    // An unreadable session may still be mid-creation: only cache good reads.
-    if (value !== null) headerCache.set(childId, value)
-    return value
+    return rows
+  }
+
+  const previewReads = new Map<string, Promise<string | undefined>>()
+  const previewOf = (row: PastRecord): Promise<string | undefined> => {
+    let pending = previewReads.get(row.childId)
+    if (!pending) {
+      pending = (async () => {
+        if (typeof ctx.sessionQuery.observeSession !== 'function') {
+          return firstPromptPreview((await ctx.sessionQuery.readSession(row.childId)).events)
+        }
+        const view = await ctx.sessionQuery.observeSession(row.childId, { projectionMode: 'none' })
+        try { return firstPromptPreview(view.events) } finally { view[Symbol.dispose]() }
+      })().finally(() => { previewReads.delete(row.childId) })
+      previewReads.set(row.childId, pending)
+    }
+    return pending
   }
 
   /**
@@ -1269,36 +1303,54 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
         }
       }
     }
-    const sidechatIds = await scanSidechatIds()
-    const recordOf = (childId: string): { parentSessionId: string; name?: string; createdAt: number } | undefined =>
-      sideChats.get(childId) ?? dormant.get(childId)
+    await pastIndex.discover(importPast)
     const items: PastItem[] = []
-    for (const childId of sidechatIds) {
-      const header = await sidechatHeader(childId)
-      if (header === null) continue
-      const record = recordOf(childId)
-      const name = record?.name
-      const base = {
-        childId,
-        ...(name === undefined ? {} : { name }),
-        createdAt: record?.createdAt || header.createdAt,
-        preview: header.preview,
-      }
-      if (record !== undefined) {
-        // Still listed somewhere: only this conversation's (or an earlier
-        // version's) count; one listed under another conversation stays there.
-        if (record.parentSessionId === parentSessionId) items.push({ ...base, status: 'listed' })
-        else if (versions.has(record.parentSessionId)) items.push({ ...base, status: 'earlier' })
-        continue
-      }
-      const owner = header.parentSessionId
-      if (owner === undefined) continue
-      if (owner === parentSessionId) {
-        items.push({ ...base, status: 'closed' })
-      } else if (versions.has(owner)) {
-        items.push({ ...base, status: 'earlier' })
+    let changed = false
+    // A crash can leave the active record committed ahead of its derived row.
+    // Repair just those listed in this lineage; do not re-import the corpus.
+    for (const records of [sideChats, dormant]) {
+      for (const record of records.values()) {
+        if (!versions.has(record.parentSessionId) || pastIndex.rows.has(record.childId)) continue
+        if (!await exists(record.childId)) continue
+        const { session, events } = await ctx.sessionQuery.readSession(record.childId)
+        if (!pastIndex.rows.has(record.childId)) {
+          pastIndex.rows.set(record.childId, {
+            childId: record.childId, parentSessionId: session.parentSession ?? record.parentSessionId,
+            createdAt: session.createdAt ?? record.createdAt, preview: firstPromptPreview(events),
+          })
+          changed = true
+        }
       }
     }
+    for (const row of pastIndex.rows.values()) {
+      const { childId } = row
+      const record = sideChats.get(childId) ?? dormant.get(childId)
+      const owner = record?.parentSessionId ?? row.parentSessionId
+      if (!versions.has(owner)) continue
+      if (!sideChats.has(childId) && !await exists(childId)) {
+        pastIndex.rows.delete(childId)
+        changed = true
+        continue
+      }
+      if (row.preview === undefined) {
+        // Only the requested lineage's previously unknown previews need logs.
+        // Leave an empty, not-yet-started session eligible for a later read.
+        try {
+          const preview = await previewOf(row)
+          if (preview !== undefined) { row.preview = preview; changed = true }
+        } catch {
+          // A header alone does not make a corrupt/unreadable session reopenable.
+          // Match the legacy list: omit it this time, retry on a later request.
+          continue
+        }
+      }
+      items.push({
+        childId, ...(record?.name === undefined ? {} : { name: record.name }),
+        createdAt: record?.createdAt || row.createdAt, preview: row.preview ?? '',
+        status: owner !== parentSessionId ? 'earlier' : record ? 'listed' : 'closed',
+      })
+    }
+    if (changed) await pastIndex.save()
     items.sort((a, b) => b.createdAt - a.createdAt)
     return { items }
   }
@@ -1313,11 +1365,18 @@ function buildApi(ctx: Context, sideChats: Map<string, SidechatRecord>, getSetti
     if (live !== undefined) {
       live.parentSessionId = parentSessionId
     } else {
-      const header = await sidechatHeader(childId)
-      if (header === null) throw new SidechatError('not-found', `side chat "${childId}" not found`, 404)
+      if (!await exists(childId)) throw new SidechatError('not-found', `side chat "${childId}" not found`, 404)
+      await pastIndex.ready
+      let row = pastIndex.rows.get(childId)
+      if (!row) {
+        const { session, events } = await ctx.sessionQuery.readSession(childId)
+        row = { childId, parentSessionId: session.parentSession ?? parentSessionId, createdAt: session.createdAt || Date.now(), preview: firstPromptPreview(events) }
+        pastIndex.rows.set(childId, row)
+        await pastIndex.save()
+      }
       const stub = dormant.get(childId)
       if (stub !== undefined) stub.parentSessionId = parentSessionId
-      else dormant.set(childId, { childId, parentSessionId, createdAt: header.createdAt || Date.now() })
+      else dormant.set(childId, { childId, parentSessionId, createdAt: row.createdAt })
     }
     persist()
     void archiveChild(childId)
