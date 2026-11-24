@@ -2772,21 +2772,25 @@ export function apply(ctx: Context): void {
   }
 
   /**
-   * The pending interaction for one Session — DSH 0.1.6-alpha.2 moved it from
-   * `uiSession.pendingInteractions` onto `uiSession.sessionStatus`; read
-   * whichever face this build exposes.
+   * The pending interaction for one Session. Read `uiSession.pendingInteractions`
+   * FIRST: DSH 0.2.2-rc.3+ exposes it as a plain ui-session source, while
+   * `uiSession.sessionStatus` became a separate Cordis service there, and merely
+   * touching `ctx.uiSession.sessionStatus` without injecting it throws
+   * (`cannot get property "uiSession.sessionStatus" without inject`) and kills
+   * the whole client plugin. Lines without `pendingInteractions` (0.2.1 –
+   * 0.2.2-rc.2) still carry the status table as an ordinary member.
    */
   const pendingInteractionFor = (sessionId: string): SidePendingInteraction | undefined => {
-    if (ctx.uiSession.sessionStatus !== undefined) {
-      return ctx.uiSession.sessionStatus.getSnapshot().get(sessionId)?.pendingInteraction
+    if (ctx.uiSession.pendingInteractions !== undefined) {
+      return ctx.uiSession.pendingInteractions.getSnapshot().get(sessionId)
     }
-    return ctx.uiSession.pendingInteractions?.getSnapshot().get(sessionId)
+    return ctx.uiSession.sessionStatus?.getSnapshot().get(sessionId)?.pendingInteraction
   }
 
-  /** Subscribe to pending-interaction changes on whichever face this DSH exposes. */
+  /** Subscribe to pending-interaction changes on whichever face this DSH exposes (same order as above). */
   const subscribePendingInteractions = (fn: () => void): (() => void) => {
-    if (ctx.uiSession.sessionStatus !== undefined) return ctx.uiSession.sessionStatus.subscribe(fn)
     if (ctx.uiSession.pendingInteractions !== undefined) return ctx.uiSession.pendingInteractions.subscribe(fn)
+    if (ctx.uiSession.sessionStatus !== undefined) return ctx.uiSession.sessionStatus.subscribe(fn)
     return () => {}
   }
 
