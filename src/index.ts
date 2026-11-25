@@ -349,9 +349,9 @@ function turnNotice(reason: unknown): TurnNoticeBlock | undefined {
 
 /** The lookup guidance appended as an extra text block (hidden from the UI). */
 const GUIDANCE_MARKER = '[sidechat-guidance]'
-const LOOKUP_GUIDANCE = `${GUIDANCE_MARKER}[需要时，请读取工作区文件或查阅发起此问题的父会话记录来补充信息；若已尽力仍不足，请说明限制。]`
-const NO_LOOKUP_GUIDANCE = `${GUIDANCE_MARKER}[请仅基于上述内容直接回答，不要主动查阅工作区文件或父会话记录。]`
-/** Legacy (pre-marker) guidance prefixes, filtered so older messages hide too. */
+const LOOKUP_GUIDANCE = `${GUIDANCE_MARKER}[When needed, read workspace files or consult the parent session's transcript that this question came from to fill in information; if that is still not enough after a real effort, state the limitation.]`
+const NO_LOOKUP_GUIDANCE = `${GUIDANCE_MARKER}[Answer directly based only on the content above; do not proactively read workspace files or the parent session's transcript.]`
+/** Legacy guidance prefixes (pre-marker Chinese text), filtered so older messages hide too. */
 const LEGACY_GUIDANCE_PREFIXES = ['[需要时，请读取工作区文件', '[请仅基于上述内容']
 
 /** Decode one base64 string into bytes (host-side; Node Buffer). */
